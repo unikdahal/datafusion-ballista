@@ -89,6 +89,33 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
     type ExecuteQueryPushStream =
         Pin<Box<dyn Stream<Item = Result<GetJobStatusResult, Status>> + Send>>;
 
+    async fn open_shuffle_input(
+        &self,
+        request: Request<ballista_core::serde::protobuf::OpenShuffleInputParams>,
+    ) -> Result<Response<ballista_core::serde::protobuf::ShuffleInputResult>, Status>
+    {
+        let request = request.into_inner();
+        self.read_shuffle_input(request.handle, request.output_partition_ids, 0, 0)
+            .await
+            .map(Response::new)
+    }
+
+    async fn poll_shuffle_input(
+        &self,
+        request: Request<ballista_core::serde::protobuf::PollShuffleInputParams>,
+    ) -> Result<Response<ballista_core::serde::protobuf::ShuffleInputResult>, Status>
+    {
+        let request = request.into_inner();
+        self.read_shuffle_input(
+            request.handle,
+            request.output_partition_ids,
+            request.after_version,
+            request.max_wait_ms,
+        )
+        .await
+        .map(Response::new)
+    }
+
     async fn poll_work(
         &self,
         request: Request<PollWorkParams>,
@@ -803,6 +830,100 @@ fn extract_connect_info<T>(request: &Request<T>) -> Option<ConnectInfo<SocketAdd
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {
+    async fn read_shuffle_input(
+        &self,
+        handle: Option<ballista_core::serde::protobuf::ShuffleInputHandle>,
+        partitions: Vec<u32>,
+        after: u64,
+        max_wait_ms: u32,
+    ) -> Result<ballista_core::serde::protobuf::ShuffleInputResult, Status> {
+        use crate::state::shuffle_input::{ShuffleInputLifecycle, ShuffleInputRead};
+        use ballista_core::serde::protobuf as pb;
+        let handle =
+            handle.ok_or_else(|| Status::invalid_argument("missing shuffle handle"))?;
+        if handle.job_id.is_empty()
+            || handle.generation == 0
+            || partitions.is_empty()
+            || partitions.len() > 65536
+        {
+            return Err(Status::invalid_argument(
+                "invalid shuffle handle or partition selection",
+            ));
+        }
+        let job = handle.job_id.into();
+        let stage = handle.stage_id as usize;
+        let graph = self
+            .state
+            .task_manager
+            .get_active_execution_graph(&job)
+            .ok_or_else(|| Status::not_found("shuffle job closed"))?;
+        let registry = graph.read().await.shuffle_inputs().ok_or_else(|| {
+            Status::failed_precondition("graph has no pipelined inputs")
+        })?;
+        let partitions: Vec<_> = partitions.into_iter().map(|p| p as usize).collect();
+        let notify = registry
+            .lock()
+            .notification(&job, stage)
+            .ok_or_else(|| Status::not_found("shuffle input closed"))?;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(max_wait_ms.min(30000)));
+        loop {
+            // Register before inspecting state: notify_waiters does not store a permit.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let read = registry
+                .lock()
+                .read(&job, stage, handle.generation, after, &partitions)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let result = match read {
+                ShuffleInputRead::Closed => {
+                    return Err(Status::not_found("shuffle input closed"));
+                }
+                ShuffleInputRead::Invalidated { expected, current } => {
+                    pb::shuffle_input_result::Result::Invalidated(
+                        pb::ShuffleGenerationInvalidated {
+                            expected_generation: expected,
+                            current_generation: current,
+                        },
+                    )
+                }
+                ShuffleInputRead::Update(update) => {
+                    if update.version == after
+                        && update.lifecycle == ShuffleInputLifecycle::Producing
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        let _ = tokio::time::timeout_at(deadline, notified).await;
+                        continue;
+                    }
+                    let locations = update
+                        .locations
+                        .into_iter()
+                        .map(|block| {
+                            Ok(pb::VersionedPartitionLocation {
+                                published_version: block.published_version,
+                                location: Some(block.location.try_into().map_err(
+                                    |e: BallistaError| Status::internal(e.to_string()),
+                                )?),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Status>>()?;
+                    pb::shuffle_input_result::Result::Update(pb::ShuffleInputUpdate {
+                        generation: update.generation,
+                        version: update.version,
+                        lifecycle: match update.lifecycle {
+                            ShuffleInputLifecycle::Producing => 0,
+                            ShuffleInputLifecycle::Sealed => 1,
+                        },
+                        locations,
+                    })
+                }
+            };
+            return Ok(pb::ShuffleInputResult {
+                result: Some(result),
+            });
+        }
+    }
     async fn create_context(
         &self,
         settings: &[KeyValuePair],

@@ -933,9 +933,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         &self,
         job_id: &JobId,
     ) -> Option<Arc<RwLock<ExecutionGraphBox>>> {
-        self.active_job_cache
-            .remove(job_id)
-            .map(|value| value.1.execution_graph)
+        self.active_job_cache.remove(job_id).map(|value| {
+            let graph = value.1.execution_graph;
+            let closing = graph.clone();
+            let job_id = job_id.clone();
+            tokio::spawn(async move {
+                if let Some(registry) = closing.read().await.shuffle_inputs() {
+                    registry.lock().close_job(&job_id);
+                }
+            });
+            graph
+        })
     }
 
     /// Clean up a failed job in FailedJobs Keyspace by delayed clean_up_interval seconds
