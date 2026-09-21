@@ -418,10 +418,20 @@ impl StaticExecutionGraph {
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
 
+        let pipelining_requested =
+            session_config.ballista_shuffle_pipelined_enabled();
+        let adaptive_enabled =
+            session_config.ballista_adaptive_query_planner_enabled();
+        if pipelining_requested && adaptive_enabled {
+            warn!(
+                "ballista.shuffle.pipelined.enabled=true is ignored because \
+                 ballista.planner.adaptive.enabled=true; disable adaptive planning \
+                 to enable experimental static pipelined shuffle"
+            );
+        }
+
         let mut shuffle_inputs = super::shuffle_input::ShuffleInputRegistry::default();
-        if session_config.ballista_shuffle_pipelined_enabled()
-            && !session_config.ballista_adaptive_query_planner_enabled()
-        {
+        if pipelining_requested && !adaptive_enabled {
             for stage_id in stages.keys() {
                 shuffle_inputs.create(job_id, *stage_id);
             }
@@ -874,7 +884,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
-                        if task_stage_attempt_num != running_stage.stage_attempt_num {
+                        if task_stage_attempt_num < running_stage.stage_attempt_num {
                             warn!(
                                 "Ignore TaskStatus update with TID {} as it's from Stage {}.{} and there is a more recent stage attempt {}.{} running",
                                 task_status.task_id,
@@ -890,7 +900,15 @@ impl ExecutionGraph for StaticExecutionGraph {
                             "TID {}/{}.{}/{}",
                             job_id, stage_id, task_stage_attempt_num, task_id
                         );
-                        if !running_stage.update_task_info(task_id, task_status.clone()) {
+                        let task_status_for_update = task_status.clone();
+                        let is_success = matches!(
+                            task_status.status.as_ref(),
+                            Some(task_status::Status::Successful(_))
+                        );
+                        if !is_success
+                            && !running_stage
+                                .update_task_info(task_id, task_status_for_update.clone())
+                        {
                             continue;
                         }
 
@@ -1028,9 +1046,17 @@ impl ExecutionGraph for StaticExecutionGraph {
                             successful_task,
                         )) = status
                         {
-                            // update task metrics for successful task
-                            running_stage
-                                .update_task_metrics(task_id, operator_metrics)?;
+                            if !running_stage
+                                .can_update_task_info(task_id, &task_status_for_update)
+                            {
+                                continue;
+                            }
+
+                            // Prepare every fallible side effect before accepting
+                            // task success. Once preparation succeeds, the graph
+                            // update and registry commit below are infallible.
+                            let prepared_metrics = running_stage
+                                .prepare_task_metrics(task_id, operator_metrics)?;
 
                             let SuccessfulTask {
                                 partitions,
@@ -1038,26 +1064,47 @@ impl ExecutionGraph for StaticExecutionGraph {
                                 window_state,
                                 ..
                             } = successful_task;
-                            running_stage
-                                .append_runtime_stats_reports(task_id, runtime_stats);
-                            running_stage
-                                .append_window_state_reports(task_id, window_state);
-
                             let mut committed = partition_to_location(
                                 &job_id, task_id, stage_id, executor, partitions,
                             );
+
+                            // Generation identifies the consumer-visible metadata
+                            // history, not a producer task attempt. A still-valid
+                            // in-flight task publishes into the current generation
+                            // after rollover; reset/lost tasks are rejected above
+                            // before they can reach publication.
                             let mut registry = self.shuffle_inputs.lock();
-                            if let Some(generation) =
-                                registry.get(&job_id, stage_id).map(|s| s.generation())
+                            let prepared_commit = if let Some(generation) =
+                                registry
+                                    .get(&job_id, stage_id)
+                                    .map(|state| state.generation())
                             {
-                                registry.commit(
+                                Some(registry.prepare_commit(
                                     &job_id,
                                     stage_id,
                                     generation,
                                     task_id,
                                     committed.clone(),
-                                )?;
+                                )?)
+                            } else {
+                                None
+                            };
+
+                            running_stage.apply_task_info(
+                                task_id,
+                                task_status_for_update,
+                            );
+                            running_stage
+                                .apply_prepared_task_metrics(prepared_metrics);
+                            running_stage
+                                .append_runtime_stats_reports(task_id, runtime_stats);
+                            running_stage
+                                .append_window_state_reports(task_id, window_state);
+
+                            if let Some(prepared_commit) = prepared_commit {
+                                registry.commit_prepared(prepared_commit);
                             }
+                            drop(registry);
                             locations.append(&mut committed);
                         } else {
                             warn!(
@@ -2151,6 +2198,79 @@ mod test {
             _ => panic!("expected the original running stage"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_shuffle_publication_does_not_accept_task_success()
+    -> Result<()> {
+        let executor = mock_executor("executor-id1".to_string());
+        let mut graph = test_aggregation_plan(2).await;
+        graph.revive();
+
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+        let task_id = task.key.task_id;
+        let job_id = graph.job_id.clone();
+
+        {
+            let mut registry = graph.shuffle_inputs.lock();
+            registry.create(&job_id, stage_id);
+            let generation = registry
+                .get(&job_id, stage_id)
+                .expect("registry state")
+                .generation();
+            registry.seal(&job_id, stage_id, generation)?;
+        }
+
+        let task_status = mock_completed_task(task, &executor.id);
+        assert!(
+            graph
+                .update_task_status(&executor, vec![task_status], 1, 1)
+                .is_err(),
+            "publication into a sealed generation must fail"
+        );
+
+        let ExecutionStage::Running(stage) = graph
+            .stages
+            .get(&stage_id)
+            .expect("stage should remain running")
+        else {
+            panic!("failed publication must not transition the stage");
+        };
+        assert!(matches!(
+            stage.task_infos[task_id].task_status,
+            task_status::Status::Running(_)
+        ));
+        assert!(
+            stage.stage_metrics.is_none(),
+            "metrics must not be applied before publication is accepted"
+        );
+        assert!(stage.runtime_stats_reports.is_empty());
+        assert!(stage.window_state_reports.is_empty());
+
+        let registry = graph.shuffle_inputs.lock();
+        let state = registry
+            .get(&job_id, stage_id)
+            .expect("registry state should remain present");
+        assert!(!state.has_committed_input());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipelining_disabled_does_not_initialize_shuffle_registry()
+    -> Result<()> {
+        let graph = test_aggregation_plan(2).await;
+        let registry = graph.shuffle_inputs.lock();
+        for stage_id in graph.stages.keys() {
+            assert!(
+                registry.get(&graph.job_id, *stage_id).is_none(),
+                "feature-off graph must retain the legacy scheduler path"
+            );
+        }
         Ok(())
     }
 
