@@ -115,6 +115,168 @@ mod tests {
         assert_eq!(source.0.load(Ordering::SeqCst), 2);
         Ok(())
     }
+
+    #[derive(Debug)]
+    struct ReplaySource {
+        calls: AtomicUsize,
+        locations: Vec<pb::PartitionLocation>,
+        invalidate: bool,
+    }
+
+    #[async_trait]
+    impl ShuffleInputClient for ReplaySource {
+        async fn update(
+            &self,
+            handle: pb::ShuffleInputHandle,
+            _: u32,
+            _: Option<u64>,
+        ) -> std::result::Result<pb::ShuffleInputResult, tonic::Status> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 && self.invalidate {
+                return Ok(pb::ShuffleInputResult {
+                    result: Some(pb::shuffle_input_result::Result::Invalidated(
+                        pb::ShuffleGenerationInvalidated {
+                            expected_generation: handle.generation,
+                            current_generation: handle.generation + 1,
+                        },
+                    )),
+                });
+            }
+            let locations = self
+                .locations
+                .iter()
+                .take(if call == 0 { 1 } else { 2 })
+                .enumerate()
+                .map(|(index, location)| pb::VersionedPartitionLocation {
+                    published_version: index as u64 + 1,
+                    location: Some(location.clone()),
+                })
+                .collect();
+            Ok(pb::ShuffleInputResult {
+                result: Some(pb::shuffle_input_result::Result::Update(
+                    pb::ShuffleInputUpdate {
+                        generation: handle.generation,
+                        version: call as u64 + 1,
+                        lifecycle: if call == 0 { 0 } else { 1 },
+                        locations,
+                    },
+                )),
+            })
+        }
+    }
+
+    async fn materialized_replay(invalidate: bool) -> Result<()> {
+        use crate::serde::scheduler::{ExecutorMetadata, PartitionId, PartitionStats};
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::arrow::ipc::writer::StreamWriter;
+        use datafusion::arrow::record_batch::RecordBatch;
+        let directory = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let mut locations = vec![];
+        for task in 0..2 {
+            let location = PartitionLocation {
+                map_partition_id: task,
+                partition_id: PartitionId::new(&"job".into(), 1, 6),
+                executor_meta: ExecutorMetadata {
+                    id: "local".into(),
+                    host: "localhost".into(),
+                    port: 1,
+                    grpc_port: 2,
+                    specification: Default::default(),
+                    os_info: Default::default(),
+                },
+                partition_stats: PartitionStats::default(),
+                file_id: Some(task as u64),
+                is_sort_shuffle: false,
+            };
+            let path = location.path(directory.path().to_str().unwrap())?;
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let mut writer =
+                StreamWriter::try_new(std::fs::File::create(path)?, &schema)?;
+            writer.write(&RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![task as i32]))],
+            )?)?;
+            writer.finish()?;
+            locations.push(
+                location
+                    .try_into()
+                    .map_err(|e: BallistaError| e.into_datafusion())?,
+            );
+        }
+        let source = Arc::new(ReplaySource {
+            calls: AtomicUsize::new(0),
+            locations,
+            invalidate,
+        });
+        let config = SessionConfig::new()
+            .with_extension(Arc::new(ShuffleInputRuntime(source.clone())));
+        let reader = PipelinedShuffleReaderExec::try_new(
+            pb::ShuffleInputHandle {
+                job_id: "job".into(),
+                stage_id: 1,
+                generation: 1,
+            },
+            vec![6],
+            schema,
+            Partitioning::UnknownPartitioning(1),
+        )?
+        .with_fetch_runtime(directory.path().to_string_lossy().into_owned(), None);
+        let mut stream = reader.execute(
+            0,
+            Arc::new(TaskContext::default().with_session_config(config)),
+        )?;
+        let mut values = vec![];
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => values.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                ),
+                Err(error) if invalidate => {
+                    assert!(matches!(
+                        BallistaError::from(error),
+                        BallistaError::ShuffleGenerationInvalidated {
+                            expected: 1,
+                            current: 2,
+                            ..
+                        }
+                    ));
+                    assert_eq!(values, vec![0]);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        assert!(
+            !invalidate,
+            "invalidated input must fail, never produce EOF"
+        );
+        assert_eq!(values, vec![0, 1]);
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_metadata_reads_each_materialized_block_once() -> Result<()> {
+        materialized_replay(false).await
+    }
+
+    #[tokio::test]
+    async fn invalidation_after_consumption_never_mixes_generations() -> Result<()> {
+        materialized_replay(true).await
+    }
 }
 
 #[async_trait]
@@ -355,6 +517,15 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                 failures += 1;
                                 tokio::time::sleep(Duration::from_millis(100 * failures))
                                     .await;
+                            }
+                            // Open/PollShuffleInput reserves ABORTED for
+                            // scheduler admission revocation. Do not reuse that
+                            // code for unrelated shuffle RPC failures.
+                            Err(status) if status.code() == tonic::Code::Aborted => {
+                                return Err(BallistaError::TailAdmissionRevoked {
+                                    stage_id: reader.handle.stage_id as usize,
+                                }
+                                .into_datafusion());
                             }
                             Err(status) => {
                                 return Err(BallistaError::from(status).into_datafusion());
