@@ -834,7 +834,19 @@ message FailedTask {
     // A successful task's result is lost due to executor lost
     ResultLost result_lost = 8;
     TaskKilled task_killed = 9;
+    ShuffleInputInvalidated shuffle_input_invalidated = 10;
+    TailAdmissionRevoked tail_admission_revoked = 11;
   }
+}
+
+message ShuffleInputInvalidated {
+  uint32 stage_id = 1;
+  uint64 expected_generation = 2;
+  uint64 current_generation = 3;
+}
+
+message TailAdmissionRevoked {
+  uint32 stage_id = 1;
 }
 
 message SuccessfulTask {
