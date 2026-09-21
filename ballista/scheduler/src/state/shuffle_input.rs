@@ -342,6 +342,44 @@ impl ShuffleInputRegistry {
         });
     }
 
+    /// Reconcile with accepted task state after existing lost-output recovery.
+    pub fn retain_tasks(
+        &mut self,
+        job: &JobId,
+        stage: usize,
+        accepted: &HashSet<usize>,
+    ) -> Result<bool> {
+        let Some(state) = self.get(job, stage) else {
+            return Ok(false);
+        };
+        let lost: HashSet<_> = state
+            .blocks
+            .keys()
+            .filter(|key| !accepted.contains(&key.producer_task_id))
+            .copied()
+            .collect();
+        if lost.is_empty() {
+            return Ok(false);
+        }
+        self.invalidate(job, stage, state.generation, &lost)?;
+        Ok(true)
+    }
+
+    /// Compatibility snapshot for stage rollback and the blocking planner.
+    pub fn stage_output(
+        &self,
+        job: &JobId,
+        stage: usize,
+    ) -> Option<super::execution_stage::StageOutput> {
+        let state = self.get(job, stage)?;
+        let mut output = super::execution_stage::StageOutput::new();
+        for block in state.blocks.values() {
+            output.add_partition(block.location.clone());
+        }
+        output.complete = state.lifecycle == ShuffleInputLifecycle::Sealed;
+        Some(output)
+    }
+
     fn current(
         &self,
         job: &JobId,
@@ -481,6 +519,82 @@ mod tests {
             registry.read(&job, 1, 2, 0, &[0])?,
             ShuffleInputRead::Closed
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn retain_tasks_drops_entire_retired_attempt_and_replays_survivors() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+
+        registry.commit(
+            &job,
+            1,
+            1,
+            0,
+            vec![location(0, 0), location(0, 1)],
+        )?;
+        registry.commit(
+            &job,
+            1,
+            1,
+            1,
+            vec![location(1, 0), location(1, 1)],
+        )?;
+
+        assert!(registry.retain_tasks(&job, 1, &HashSet::from([1]))?);
+        assert_eq!(registry.get(&job, 1).unwrap().generation(), 2);
+        let ShuffleInputRead::Update(snapshot) =
+            registry.read(&job, 1, 2, 0, &[0, 1])?
+        else {
+            panic!()
+        };
+        assert_eq!(snapshot.locations.len(), 2);
+        assert!(
+            snapshot
+                .locations
+                .iter()
+                .all(|block| block.location.map_partition_id == 1)
+        );
+
+        // A successful retry gets a fresh append-only task ID. Reconciliation
+        // must retain both the surviving old task and the accepted retry, never
+        // resurrect task 0 from the retired attempt.
+        registry.commit(
+            &job,
+            1,
+            2,
+            2,
+            vec![location(2, 0), location(2, 1)],
+        )?;
+        assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
+        let ShuffleInputRead::Update(snapshot) =
+            registry.read(&job, 1, 2, 0, &[0, 1])?
+        else {
+            panic!()
+        };
+        let producers: HashSet<_> = snapshot
+            .locations
+            .iter()
+            .map(|block| block.location.map_partition_id)
+            .collect();
+        assert_eq!(producers, HashSet::from([1, 2]));
+
+        assert!(registry.retain_tasks(&job, 1, &HashSet::from([2]))?);
+        assert_eq!(registry.get(&job, 1).unwrap().generation(), 3);
+        let ShuffleInputRead::Update(snapshot) =
+            registry.read(&job, 1, 3, 0, &[0, 1])?
+        else {
+            panic!()
+        };
+        assert_eq!(snapshot.locations.len(), 2);
+        assert!(
+            snapshot
+                .locations
+                .iter()
+                .all(|block| block.location.map_partition_id == 2)
+        );
         Ok(())
     }
 
