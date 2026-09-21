@@ -847,6 +847,12 @@ pub fn rollback_resolved_shuffles(
         if let Some(reader) = child
             .downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>(
         ) {
+            // Rollback always receives the scheduler's stored, unsliced stage
+            // plan. Task-local partition restriction is applied only when a
+            // TaskDescription is built, so reader.properties().partitioning
+            // still describes the full stage here. Reconstructing an
+            // UnresolvedShuffleExec from a task-restricted reader would lose
+            // partitions and is intentionally unsupported.
             new_children.push(Arc::new(UnresolvedShuffleExec::new(
                 reader.handle.stage_id as usize,
                 reader.schema(),
