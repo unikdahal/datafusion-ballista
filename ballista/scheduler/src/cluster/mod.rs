@@ -681,7 +681,7 @@ mod test {
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
         mock_completed_task, mock_executor, revive_graph_and_complete_next_stage,
-        test_aggregation_plan_with_config,
+        test_two_aggregations_plan_with_config,
     };
     use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
     use ballista_core::extension::SessionConfigExt;
@@ -940,7 +940,7 @@ mod test {
                 .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1"),
         );
         let graph =
-            test_aggregation_plan_with_config(4, job_id, session_config).await;
+            test_two_aggregations_plan_with_config(4, job_id, session_config).await;
         // Deliberately return the untouched builder result. The real binder
         // must preserve the legacy Resolved -> Running revival transition.
         JobInfoCache::new(Box::new(graph))
