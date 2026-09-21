@@ -590,7 +590,7 @@ pub enum StageAdmission {
 }
 
 impl StageAdmission {
-    fn from_plan(plan: &Arc<dyn ExecutionPlan>) -> Self {
+    pub(crate) fn from_plan(plan: &Arc<dyn ExecutionPlan>) -> Self {
         fn visit(
             plan: &dyn ExecutionPlan,
             inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
@@ -962,7 +962,9 @@ impl RunningStage {
         self.task_infos[task_id] = updated_task_info;
 
         match task_status {
-            task_status::Status::Failed(failed_task) if failed_task.retryable => {
+            task_status::Status::Failed(failed_task)
+                if failed_task.retryable && failed_task.count_to_failures =>
+            {
                 for p in &global_input_partition_ids {
                     self.task_failure_numbers[*p] += 1;
                 }
