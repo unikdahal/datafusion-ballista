@@ -111,706 +111,6 @@ const PIPELINED_SHUFFLE_RECOVERY_READY: bool = true;
 /// publish its outputs to the `ExecutionGraph`s `output_locations` representing the final query results.
 pub trait ExecutionGraph: Debug {
     /// Runtime metadata is absent for graph implementations without pipelining.
-    fn release_task_vcores(&mut self, status: &TaskStatus) -> u32 {
-        self.task_vcores(status.stage_id as usize, status.task_id as usize)
-            .unwrap_or(0)
-    }
-
-    /// returns next task to run
-    /// (used for testing only)
-    #[cfg(test)]
-    fn pop_next_task(&mut self, executor_id: &str) -> Result<Option<TaskDescription>>;
-
-    /// Returns the total number of stages in this execution graph.
-    fn stage_count(&self) -> usize;
-
-    /// Clones execution graph
-    fn cloned(&self) -> ExecutionGraphBox;
-}
-
-/// [ExecutionGraph] implementation which generates
-/// all stages on job submission time
-#[derive(Clone)]
-pub struct StaticExecutionGraph {
-    retired_tasks: HashMap<usize, Vec<TaskInfo>>,
-    retired_vcores: HashMap<(usize, usize, usize), u32>,
-    refunded_tasks: HashSet<(usize, usize, usize)>,
-    /// Operators such as LIMIT may finish without draining their inputs. Hold
-    /// their success until all pinned histories seal, so it cannot escape recovery.
-    deferred_successes: Vec<(ExecutorMetadata, TaskStatus)>,
-    /// Scheduler-local recovery history. The current JobState implementation
-    /// does not reacquire running execution graphs after restart; any future
-    /// persistent/HA JobState must persist/rebuild this registry before it can
-    /// safely resume a pipelined job.
-    shuffle_inputs: Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>,
-    /// Curator scheduler name. Can be `None` is `ExecutionGraph` is not currently curated by any scheduler
-    #[allow(dead_code)] // not used at the moment, will be used later
-    scheduler_id: Option<String>,
-    /// ID for this job
-    job_id: JobId,
-    /// Job name, can be empty string
-    job_name: String,
-    /// Session ID for this job
-    session_id: String,
-    /// Status of this job
-    status: JobStatus,
-    /// Timestamp of when this job was submitted
-    queued_at: u64,
-    /// Job start time
-    start_time: u64,
-    /// Job end time
-    end_time: u64,
-    /// Map from Stage ID -> ExecutionStage
-    stages: HashMap<usize, ExecutionStage>,
-    /// Locations of this `ExecutionGraph` final output locations
-    output_locations: Vec<PartitionLocation>,
-    /// Failed stage attempts, record the failed stage attempts to limit the retry times.
-    /// Map from Stage ID -> Set<Stage_ATTPMPT_NUM>
-    failed_stage_attempts: HashMap<usize, HashSet<usize>>,
-    /// Session config for this job
-    session_config: Arc<SessionConfig>,
-    /// Logical plan as a human-readable string, captured at submission time.
-    logical_plan: Option<String>,
-    /// Physical plan as a human-readable string, captured at submission time.
-    physical_plan: Arc<dyn ExecutionPlan>,
-}
-
-/// Information about a currently running task.
-///
-/// Used to track tasks that are in progress and may need to be cancelled
-/// when an executor is lost or a job is cancelled.
-#[derive(Clone, Debug)]
-pub struct RunningTaskInfo {
-    /// Append-order slot of this task in `RunningStage.task_infos`;
-    /// `(job_id, stage_id, task_id)` is globally unique.
-    pub task_id: usize,
-    /// The job ID this task belongs to.
-    pub job_id: JobId,
-    /// The stage ID this task belongs to.
-    pub stage_id: usize,
-    /// The executor ID where this task is running.
-    pub executor_id: String,
-}
-
-impl StaticExecutionGraph {
-    /// Restore retired append-only task slots when a revoked tail attempt is
-    /// rebuilt. The new attempt intentionally keeps *all* input partitions
-    /// pending: the retired TaskInfo entries reserve their old task IDs only;
-    /// they are not evidence that any partition completed in the new attempt.
-    fn restore_task_identity(&self, stage: &mut RunningStage) {
-        if let Some(retired) = self.retired_tasks.get(&stage.stage_id) {
-            stage.task_infos = retired.clone();
-        }
-    }
-    fn reconcile_pipelined(&mut self) -> Result<Vec<RunningTaskInfo>> {
-        use super::execution_stage::StageAdmission;
-        if !self.pipelining_enabled() {
-            return Ok(vec![]);
-        }
-        let mut cancel = vec![];
-        loop {
-            let mut invalidated = HashSet::new();
-            for (id, stage) in &self.stages {
-                let accepted = stage
-                    .task_infos()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|info| {
-                        matches!(info.task_status, task_status::Status::Successful(_))
-                            .then_some(info.task_id)
-                    })
-                    .collect();
-                if self.shuffle_inputs.lock().retain_tasks(
-                    &self.job_id,
-                    *id,
-                    &accepted,
-                )? {
-                    invalidated.insert(*id);
-                }
-            }
-            let rollback: Vec<_> = self
-                .stages
-                .iter()
-                .filter_map(|(id, stage)| {
-                    let (inputs, admission) = match stage {
-                        ExecutionStage::Running(s) => (&s.inputs, s.admission.clone()),
-                        ExecutionStage::Resolved(s) => (&s.inputs, s.admission.clone()),
-                        ExecutionStage::Successful(s) => {
-                            (&s.inputs, StageAdmission::from_plan(&s.plan))
-                        }
-                        _ => return None,
-                    };
-                    let history_lost =
-                        inputs.keys().any(|producer| invalidated.contains(producer));
-                    let revoked = match admission {
-                        StageAdmission::Normal => false,
-                        StageAdmission::TailPipelined(handles) => {
-                            !self.input_histories_ready(&handles, false)
-                        }
-                    };
-                    (history_lost || revoked).then_some(*id)
-                })
-                .collect();
-            for id in &rollback {
-                if matches!(self.stages.get(id), Some(ExecutionStage::Successful(_))) {
-                    self.rerun_successful_stage(*id);
-                }
-                match self.stages.get(id) {
-                    Some(ExecutionStage::Running(_)) => {
-                        cancel.extend(self.rollback_running_stage(*id, HashSet::new())?);
-                    }
-                    Some(ExecutionStage::Resolved(_)) => {
-                        self.rollback_resolved_stage(*id)?;
-                    }
-                    _ => {}
-                }
-                if self
-                    .stages
-                    .get(id)
-                    .is_some_and(|stage| stage.output_links().is_empty())
-                {
-                    self.output_locations.clear();
-                }
-                self.deferred_successes
-                    .retain(|(_, status)| status.stage_id as usize != *id);
-            }
-            // Refresh dependency mirrors from the authoritative committed history.
-            let registry = self.shuffle_inputs.lock();
-            for stage in self.stages.values_mut() {
-                let inputs = match stage {
-                    ExecutionStage::UnResolved(s) => &mut s.inputs,
-                    ExecutionStage::Resolved(s) => &mut s.inputs,
-                    ExecutionStage::Running(s) => &mut s.inputs,
-                    _ => continue,
-                };
-                for (producer, output) in inputs {
-                    if let Some(current) = registry.stage_output(&self.job_id, *producer)
-                    {
-                        *output = current;
-                    }
-                }
-            }
-            drop(registry);
-            if rollback.is_empty() {
-                break;
-            }
-        }
-        // A revoked consumer whose inputs have since sealed uses the blocking path.
-        let ready: Vec<_> = self
-            .stages
-            .iter()
-            .filter_map(|(id, stage)| {
-                matches!(stage, ExecutionStage::UnResolved(s) if s.resolvable())
-                    .then_some(*id)
-            })
-            .collect();
-        for id in ready {
-            self.resolve_stage(id)?;
-        }
-        Ok(cancel)
-    }
-    fn input_histories_ready(
-        &self,
-        handles: &[ballista_core::serde::protobuf::ShuffleInputHandle],
-        require_sealed: bool,
-    ) -> bool {
-        use super::shuffle_input::ShuffleInputLifecycle;
-        let registry = self.shuffle_inputs.lock();
-        handles.iter().all(|handle| {
-            let Some(state) = registry.get(&self.job_id, handle.stage_id as usize) else { return false; };
-            if state.generation() != handle.generation { return false; }
-            if state.lifecycle() == ShuffleInputLifecycle::Sealed { return true; }
-            if require_sealed || !state.has_committed_input() { return false; }
-            matches!(self.stages.get(&(handle.stage_id as usize)), Some(ExecutionStage::Running(producer)) if producer.pending.is_empty())
-        })
-    }
-
-    fn resolve_tail_stages(&mut self) -> Result<()> {
-        let candidates: Vec<_> = self
-            .stages
-            .iter()
-            .filter_map(|(id, stage)| {
-                let ExecutionStage::UnResolved(stage) = stage else {
-                    return None;
-                };
-                if stage.resolvable() {
-                    return None;
-                }
-                let handles = self.pipelined_handles(stage)?;
-                let input_refs: Vec<_> = handles.values().cloned().collect();
-                self.input_histories_ready(&input_refs, false)
-                    .then_some((*id, handles))
-            })
-            .collect();
-        for (id, handles) in candidates {
-            let Some(ExecutionStage::UnResolved(stage)) = self.stages.get(&id) else {
-                continue;
-            };
-            let resolved = stage.to_pipelined_resolved(&handles)?;
-            let mut running = resolved.to_running();
-            self.restore_task_identity(&mut running);
-            self.stages.insert(id, ExecutionStage::Running(running));
-        }
-        Ok(())
-    }
-    fn pipelining_enabled(&self) -> bool {
-        self.session_config.ballista_shuffle_pipelined_enabled()
-            && !self
-                .session_config
-                .ballista_adaptive_query_planner_enabled()
-    }
-
-    /// Eligibility is structural. Admission separately checks producer pending work.
-    fn pipelined_handles(
-        &self,
-        stage: &UnresolvedStage,
-    ) -> Option<HashMap<usize, ballista_core::serde::protobuf::ShuffleInputHandle>> {
-        if !self.pipelining_enabled()
-            || stage.output_links.is_empty()
-            || stage.inputs.is_empty()
-        {
-            return None;
-        }
-        fn eligible(plan: &dyn ExecutionPlan) -> bool {
-            if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
-                return !reader.broadcast
-                    && reader.coalesce.is_none()
-                    && !matches!(
-                        reader.properties().partitioning,
-                        datafusion::physical_plan::Partitioning::Range(_)
-                    );
-            }
-            !plan.is::<RangeShuffleWriterExec>()
-                && plan.children().iter().all(|child| eligible(child.as_ref()))
-        }
-        if !eligible(stage.plan.as_ref()) {
-            return None;
-        }
-        let registry = self.shuffle_inputs.lock();
-        stage
-            .inputs
-            .keys()
-            .map(|producer| {
-                let producer_plan = self.stages.get(producer)?.plan();
-                if producer_plan.is::<RangeShuffleWriterExec>() {
-                    return None;
-                }
-                let state = registry.get(&self.job_id, *producer)?;
-                Some((
-                    *producer,
-                    ballista_core::serde::protobuf::ShuffleInputHandle {
-                        job_id: self.job_id.to_string(),
-                        stage_id: *producer as u32,
-                        generation: state.generation(),
-                    },
-                ))
-            })
-            .collect()
-    }
-    /// Creates a new `ExecutionGraph` from a physical execution plan.
-    ///
-    /// This will use the `DistributedPlanner` to break the plan into stages
-    /// and build the DAG structure needed for distributed execution.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        scheduler_id: &str,
-        job_id: &JobId,
-        job_name: &str,
-        session_id: &str,
-        plan: Arc<dyn ExecutionPlan>,
-        queued_at: u64,
-        session_config: Arc<SessionConfig>,
-        planner: &mut dyn DistributedPlanner,
-        logical_plan: Option<String>,
-    ) -> Result<Self> {
-        let shuffle_stages =
-            planner.plan_query_stages(job_id, plan.clone(), session_config.options())?;
-
-        let builder = ExecutionStageBuilder::new(session_config.clone());
-        let stages = builder.build(shuffle_stages)?;
-
-        let mut shuffle_inputs = super::shuffle_input::ShuffleInputRegistry::default();
-        if session_config.ballista_shuffle_pipelined_enabled()
-            && !session_config.ballista_adaptive_query_planner_enabled()
-        {
-            for stage_id in stages.keys() {
-                shuffle_inputs.create(job_id, *stage_id);
-            }
-        }
-
-        let started_at = timestamp_millis();
-
-        Ok(Self {
-            retired_tasks: HashMap::new(),
-            retired_vcores: HashMap::new(),
-            refunded_tasks: HashSet::new(),
-            deferred_successes: vec![],
-            shuffle_inputs: Arc::new(parking_lot::Mutex::new(shuffle_inputs)),
-            scheduler_id: Some(scheduler_id.to_string()),
-            job_id: job_id.to_owned(),
-            job_name: job_name.to_owned(),
-            session_id: session_id.to_string(),
-
-            status: JobStatus {
-                job_id: job_id.to_string(),
-                job_name: job_name.to_string(),
-                status: Some(Status::Running(RunningJob {
-                    queued_at,
-                    started_at,
-                    scheduler: scheduler_id.to_string(),
-                })),
-            },
-            queued_at,
-            start_time: started_at,
-            end_time: 0,
-            stages,
-            output_locations: vec![],
-            failed_stage_attempts: HashMap::new(),
-            session_config,
-            logical_plan,
-            physical_plan: plan,
-        })
-    }
-
-    /// Processing stage status update after task status changing
-    fn processing_stages_update(
-        &mut self,
-        updated_stages: UpdatedStages,
-    ) -> Result<Vec<QueryStageSchedulerEvent>> {
-        let job_id = self.job_id().to_owned();
-        let mut has_resolved = false;
-        let mut job_err_msg = "".to_owned();
-
-        for stage_id in updated_stages.resolved_stages {
-            self.resolve_stage(stage_id)?;
-            has_resolved = true;
-        }
-
-        for stage_id in updated_stages.successful_stages {
-            self.succeed_stage(stage_id);
-        }
-
-        // Fail the stage and also abort the job
-        for (stage_id, err_msg) in &updated_stages.failed_stages {
-            job_err_msg =
-                format!("Job failed due to stage {stage_id} failed: {err_msg}\n");
-        }
-
-        let mut events = vec![];
-        // Only handle the rollback logic when there are no failed stages
-        if updated_stages.failed_stages.is_empty() {
-            let mut running_tasks_to_cancel = vec![];
-            for (stage_id, failure_reasons) in updated_stages.rollback_running_stages {
-                let tasks = self.rollback_running_stage(stage_id, failure_reasons)?;
-                running_tasks_to_cancel.extend(tasks);
-            }
-
-            for stage_id in updated_stages.resubmit_successful_stages {
-                self.rerun_successful_stage(stage_id);
-            }
-
-            running_tasks_to_cancel.extend(self.reconcile_pipelined()?);
-
-            if !running_tasks_to_cancel.is_empty() {
-                events.push(QueryStageSchedulerEvent::CancelTasks(
-                    running_tasks_to_cancel,
-                ));
-            }
-        }
-
-        if !updated_stages.failed_stages.is_empty() {
-            info!("Job {job_id} is failed");
-            self.fail_job(job_err_msg.clone());
-            events.push(QueryStageSchedulerEvent::JobRunningFailed {
-                job_id,
-                fail_message: job_err_msg,
-                queued_at: self.queued_at,
-                failed_at: timestamp_millis(),
-            });
-        } else if self.is_successful() {
-            // If this ExecutionGraph is successful, finish it
-            debug!("Job {job_id} is success, finalizing job output ...");
-            self.succeed_job()?;
-            events.push(QueryStageSchedulerEvent::JobFinished {
-                job_id,
-                queued_at: self.queued_at,
-                completed_at: timestamp_millis(),
-            });
-        } else if has_resolved {
-            events.push(QueryStageSchedulerEvent::JobUpdated(job_id))
-        }
-        Ok(events)
-    }
-
-    /// Return a Vec of resolvable stage ids
-    fn update_stage_output_links(
-        &mut self,
-        stage_id: usize,
-        is_completed: bool,
-        locations: Vec<PartitionLocation>,
-        output_links: Vec<usize>,
-    ) -> Result<Vec<usize>> {
-        let mut resolved_stages = vec![];
-        let job_id = &self.job_id;
-        if output_links.is_empty() {
-            // If `output_links` is empty, then this is a final stage
-            self.output_locations.extend(locations);
-        } else {
-            for link in output_links.iter() {
-                // If this is an intermediate stage, we need to push its `PartitionLocation`s to the parent stage
-                if let Some(linked_stage) = self.stages.get_mut(link) {
-                    if let ExecutionStage::UnResolved(linked_unresolved_stage) =
-                        linked_stage
-                    {
-                        linked_unresolved_stage
-                            .add_input_partitions(stage_id, locations.clone())?;
-
-                        // If all tasks for this stage are complete, mark the input complete in the parent stage
-                        if is_completed {
-                            linked_unresolved_stage.complete_input(stage_id);
-                        }
-
-                        // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
-                        if linked_unresolved_stage.resolvable() {
-                            resolved_stages.push(linked_unresolved_stage.stage_id);
-                        }
-                    } else if let ExecutionStage::Running(stage) = linked_stage
-                        && matches!(
-                            stage.admission,
-                            super::execution_stage::StageAdmission::TailPipelined(_)
-                        )
-                    {
-                        if let Some(input) = stage.inputs.get_mut(&stage_id) {
-                            for location in locations.iter().cloned() {
-                                input
-                                    .partition_locations
-                                    .entry(location.partition_id.partition_id)
-                                    .or_default()
-                                    .push(location);
-                            }
-                            input.complete = is_completed;
-                        }
-                    } else if let ExecutionStage::Resolved(stage) = linked_stage
-                        && matches!(
-                            stage.admission,
-                            super::execution_stage::StageAdmission::TailPipelined(_)
-                        )
-                    {
-                        if let Some(input) = stage.inputs.get_mut(&stage_id) {
-                            for location in locations.iter().cloned() {
-                                input
-                                    .partition_locations
-                                    .entry(location.partition_id.partition_id)
-                                    .or_default()
-                                    .push(location);
-                            }
-                            input.complete = is_completed;
-                        }
-                    } else {
-                        return Err(BallistaError::Internal(format!(
-                            "Error updating job {job_id}: The stage {link} as the output link of stage {stage_id}  should be unresolved"
-                        )));
-                    }
-                } else {
-                    return Err(BallistaError::Internal(format!(
-                        "Error updating job {job_id}: Invalid output link {stage_id} for stage {link}"
-                    )));
-                }
-            }
-        }
-        Ok(resolved_stages)
-    }
-
-    fn get_running_stage_id(&mut self, black_list: &[usize]) -> Option<usize> {
-        let mut running_stage_id = self.stages.iter().find_map(|(stage_id, stage)| {
-            if black_list.contains(stage_id) {
-                None
-            } else if let ExecutionStage::Running(stage) = stage {
-                if stage.available_tasks() > 0 {
-                    Some(*stage_id)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        });
-
-        // If no available tasks found in the running stage,
-        // try to find a resolved stage and convert it to the running stage
-        if running_stage_id.is_none() {
-            if self.revive() {
-                running_stage_id = self.get_running_stage_id(black_list);
-            } else {
-                running_stage_id = None;
-            }
-        }
-
-        running_stage_id
-    }
-
-    fn reset_stages_internal(
-        &mut self,
-        executor_id: &str,
-    ) -> Result<(HashSet<usize>, Vec<RunningTaskInfo>)> {
-        let job_id = self.job_id.clone();
-        // collect the input stages that need to resubmit
-        let mut resubmit_inputs: HashSet<usize> = HashSet::new();
-
-        let mut reset_running_stage = HashSet::new();
-        let mut rollback_resolved_stages = HashSet::new();
-        let mut rollback_running_stages = HashSet::new();
-        let mut resubmit_successful_stages = HashSet::new();
-
-        let mut empty_inputs: HashMap<usize, StageOutput> = HashMap::new();
-        // check the unresolved, resolved and running stages
-        self.stages
-            .iter_mut()
-            .for_each(|(stage_id, stage)| {
-                let stage_inputs = match stage {
-                    ExecutionStage::UnResolved(stage) => {
-                        &mut stage.inputs
-                    }
-                    ExecutionStage::Resolved(stage) => {
-                        &mut stage.inputs
-                    }
-                    ExecutionStage::Running(stage) => {
-                        let reset = stage.reset_tasks(executor_id);
-                        if reset > 0 {
-                            warn!(
-                        "Reset {reset} tasks for running job/stage {job_id}/{stage_id} on lost Executor {executor_id}"
-                        );
-                            reset_running_stage.insert(*stage_id);
-                        }
-                        &mut stage.inputs
-                    }
-                    _ => &mut empty_inputs
-                };
-
-                // For each stage input, check whether there are input locations match that executor
-                // and calculate the resubmit input stages if the input stages are successful.
-                let mut rollback_stage = false;
-                stage_inputs.iter_mut().for_each(|(input_stage_id, stage_output)| {
-                    let mut match_found = false;
-                    stage_output.partition_locations.iter_mut().for_each(
-                        |(_partition, locs)| {
-                            let before_len = locs.len();
-                            locs.retain(|loc| loc.executor_meta.id != executor_id);
-                            if locs.len() < before_len {
-                                match_found = true;
-                            }
-                        },
-                    );
-                    if match_found {
-                        stage_output.complete = false;
-                        rollback_stage = true;
-                        resubmit_inputs.insert(*input_stage_id);
-                    }
-                });
-
-                if rollback_stage {
-                    match stage {
-                        ExecutionStage::Resolved(_) => {
-                            rollback_resolved_stages.insert(*stage_id);
-                            warn!(
-                            "Roll back resolved job/stage {job_id}/{stage_id} and change ShuffleReaderExec back to UnresolvedShuffleExec");
-                        }
-                        ExecutionStage::Running(_) => {
-                            rollback_running_stages.insert(*stage_id);
-                            warn!(
-                            "Roll back running job/stage {job_id}/{stage_id} and change ShuffleReaderExec back to UnresolvedShuffleExec");
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-        // check and reset the successful stages
-        if !resubmit_inputs.is_empty() {
-            self.stages
-                .iter_mut()
-                .filter(|(stage_id, _stage)| resubmit_inputs.contains(stage_id))
-                .filter_map(|(_stage_id, stage)| {
-                    if let ExecutionStage::Successful(success) = stage {
-                        Some(success)
-                    } else {
-                        None
-                    }
-                })
-                .for_each(|stage| {
-                    let reset = stage.reset_tasks(executor_id);
-                    if reset > 0 {
-                        resubmit_successful_stages.insert(stage.stage_id);
-                        warn!(
-                            "Reset {} tasks for successful job/stage {}/{} on lost Executor {}",
-                            reset, job_id, stage.stage_id, executor_id
-                        )
-                    }
-                });
-        }
-
-        for stage_id in rollback_resolved_stages.iter() {
-            self.rollback_resolved_stage(*stage_id)?;
-        }
-
-        let mut all_running_tasks = vec![];
-        for stage_id in rollback_running_stages.iter() {
-            let tasks = self.rollback_running_stage(
-                *stage_id,
-                HashSet::from([executor_id.to_owned()]),
-            )?;
-            all_running_tasks.extend(tasks);
-        }
-
-        for stage_id in resubmit_successful_stages.iter() {
-            self.rerun_successful_stage(*stage_id);
-        }
-
-        let mut reset_stage = HashSet::new();
-        reset_stage.extend(reset_running_stage);
-        reset_stage.extend(rollback_resolved_stages);
-        reset_stage.extend(rollback_running_stages);
-        reset_stage.extend(resubmit_successful_stages);
-        Ok((reset_stage, all_running_tasks))
-    }
-
-    /// Clear the stage failure count for this stage if the stage is finally success
-    fn clear_stage_failure(&mut self, stage_id: usize) {
-        self.failed_stage_attempts.remove(&stage_id);
-    }
-}
-
-impl ExecutionGraph for StaticExecutionGraph {
-    fn release_task_vcores(&mut self, status: &TaskStatus) -> u32 {
-        if !self.pipelining_enabled() {
-            return self
-                .task_vcores(status.stage_id as usize, status.task_id as usize)
-                .unwrap_or(0);
-        }
-        let key = (
-            status.stage_id as usize,
-            status.stage_attempt_num as usize,
-            status.task_id as usize,
-        );
-        if !matches!(
-            status.status,
-            Some(task_status::Status::Successful(_) | task_status::Status::Failed(_))
-        ) || self.refunded_tasks.contains(&key)
-        {
-            return 0;
-        }
-        let current = self.stages.get(&key.0).and_then(|stage| match stage {
-            ExecutionStage::Running(stage) if stage.stage_attempt_num == key.1 => {
-                stage.task_infos.get(key.2).map(|task| task.vcores_consumed)
-            }
-            _ => None,
-        });
-        let Some(vcores) = current.or_else(|| self.retired_vcores.remove(&key)) else {
-            return 0;
-        };
-        self.refunded_tasks.insert(key);
-        vcores
-    }
     fn shuffle_inputs(
         &self,
     ) -> Option<Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>> {
@@ -1301,6 +601,37 @@ impl StaticExecutionGraph {
         Ok(())
     }
 
+    fn running_stage_for_admission_id(
+        &self,
+        black_list: &[usize],
+        tail: bool,
+    ) -> Option<usize> {
+        use super::execution_stage::StageAdmission;
+
+        self.stages
+            .iter()
+            .filter_map(|(id, stage)| {
+                let ExecutionStage::Running(stage) = stage else {
+                    return None;
+                };
+                if black_list.contains(id) || stage.pending.is_empty() {
+                    return None;
+                }
+                let eligible = match &stage.admission {
+                    StageAdmission::Normal => !tail,
+                    StageAdmission::TailPipelined(inputs) => {
+                        if self.input_histories_ready(inputs, true) {
+                            !tail
+                        } else {
+                            tail && self.input_histories_ready(inputs, false)
+                        }
+                    }
+                };
+                eligible.then_some(*id)
+            })
+            .min()
+    }
+
     fn pipelining_enabled(&self) -> bool {
         PIPELINED_SHUFFLE_RECOVERY_READY
             && self.session_config.ballista_shuffle_pipelined_enabled()
@@ -1734,6 +1065,37 @@ impl StaticExecutionGraph {
 }
 
 impl ExecutionGraph for StaticExecutionGraph {
+    fn release_task_vcores(&mut self, status: &TaskStatus) -> u32 {
+        if !self.pipelining_enabled() {
+            return self
+                .task_vcores(status.stage_id as usize, status.task_id as usize)
+                .unwrap_or(0);
+        }
+        let key = (
+            status.stage_id as usize,
+            status.stage_attempt_num as usize,
+            status.task_id as usize,
+        );
+        if !matches!(
+            status.status,
+            Some(task_status::Status::Successful(_) | task_status::Status::Failed(_))
+        ) || self.refunded_tasks.contains(&key)
+        {
+            return 0;
+        }
+        let current = self.stages.get(&key.0).and_then(|stage| match stage {
+            ExecutionStage::Running(stage) if stage.stage_attempt_num == key.1 => {
+                stage.task_infos.get(key.2).map(|task| task.vcores_consumed)
+            }
+            _ => None,
+        });
+        let Some(vcores) = current.or_else(|| self.retired_vcores.remove(&key)) else {
+            return 0;
+        };
+        self.refunded_tasks.insert(key);
+        vcores
+    }
+
     fn shuffle_inputs(
         &self,
     ) -> Option<Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>> {
@@ -2494,8 +1856,6 @@ impl ExecutionGraph for StaticExecutionGraph {
         black_list: &[usize],
         tail: bool,
     ) -> Option<&mut RunningStage> {
-        use super::execution_stage::StageAdmission;
-
         if !self.pipelining_enabled() {
             return if tail {
                 None
@@ -2520,31 +1880,17 @@ impl ExecutionGraph for StaticExecutionGraph {
             return None;
         }
 
-        let selected = self
-            .stages
-            .iter()
-            .filter_map(|(id, stage)| {
-                let ExecutionStage::Running(stage) = stage else {
-                    return None;
-                };
-                if black_list.contains(id) || stage.pending.is_empty() {
-                    return None;
-                }
-                let eligible = match &stage.admission {
-                    StageAdmission::Normal => !tail,
-                    StageAdmission::TailPipelined(inputs) => {
-                        if self.input_histories_ready(inputs, true) {
-                            !tail
-                        } else {
-                            tail && self.input_histories_ready(inputs, false)
-                        }
-                    }
-                };
-                eligible.then_some(*id)
-            })
-            .min()?;
+        let mut selected = self.running_stage_for_admission_id(black_list, tail);
 
-        match self.stages.get_mut(&selected) {
+        // Preserve the legacy scheduler's liveness transition: a fresh graph
+        // starts with source stages in Resolved state, and normal scheduling is
+        // responsible for reviving them before the first task can be bound.
+        // Tail admission never revives stages on its own.
+        if selected.is_none() && !tail && self.revive() {
+            selected = self.running_stage_for_admission_id(black_list, false);
+        }
+
+        match selected.and_then(|id| self.stages.get_mut(&id)) {
             Some(ExecutionStage::Running(stage)) => Some(stage),
             _ => None,
         }
