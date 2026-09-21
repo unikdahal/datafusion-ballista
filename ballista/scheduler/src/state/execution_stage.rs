@@ -595,21 +595,43 @@ impl StageAdmission {
             plan: &dyn ExecutionPlan,
             inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
         ) {
-            if let Some(reader) = plan.downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>() {
-                if !inputs.contains(&reader.handle) { inputs.push(reader.handle.clone()); }
+            if let Some(reader) = plan
+                .downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
+            {
+                inputs.push(reader.handle.clone());
             }
             for child in plan.children() {
                 visit(child.as_ref(), inputs);
             }
         }
+
         let mut inputs = vec![];
         visit(plan.as_ref(), &mut inputs);
+        canonicalize_admission_handles(&mut inputs);
         if inputs.is_empty() {
             Self::Normal
         } else {
             Self::TailPipelined(inputs)
         }
     }
+}
+
+/// Admission metadata is recovery state, so it must not depend on physical-plan
+/// traversal order or repeated references to the same producer generation.
+fn canonicalize_admission_handles(
+    inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
+) {
+    inputs.sort_by(|a, b| {
+        a.job_id
+            .cmp(&b.job_id)
+            .then_with(|| a.stage_id.cmp(&b.stage_id))
+            .then_with(|| a.generation.cmp(&b.generation))
+    });
+    inputs.dedup_by(|a, b| {
+        a.job_id == b.job_id
+            && a.stage_id == b.stage_id
+            && a.generation == b.generation
+    });
 }
 
 impl ResolvedStage {
@@ -866,6 +888,18 @@ impl RunningStage {
         {
             warn!(
                 "Ignore TaskStatus update for task_id {task_id} because it was already reset (executor lost)"
+            );
+            return false;
+        }
+        if matches!(
+            &task_info.task_status,
+            task_status::Status::Successful(_)
+        ) && matches!(
+            status.status.as_ref(),
+            Some(task_status::Status::Successful(_))
+        ) {
+            debug!(
+                "Ignore replayed successful TaskStatus for task_id {task_id}; terminal success is immutable"
             );
             return false;
         }
@@ -1579,6 +1613,61 @@ mod tests {
             stage.task_infos[0].task_status,
             task_status::Status::Successful(_)
         ));
+    }
+
+    #[test]
+    fn test_update_task_info_success_replay_is_idempotent() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+
+        let status = make_task_status(0);
+        assert!(stage.update_task_info(0, status.clone()));
+        assert!(!stage.update_task_info(0, status));
+        assert_eq!(stage.successful_tasks(), 1);
+        assert_eq!(stage.task_failure_numbers[0], 0);
+    }
+
+    #[test]
+    fn test_admission_handles_are_deduplicated_and_deterministic() {
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+
+        let mut handles = vec![
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 3,
+                generation: 2,
+            },
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 1,
+                generation: 4,
+            },
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 3,
+                generation: 2,
+            },
+            ShuffleInputHandle {
+                job_id: "another".to_string(),
+                stage_id: 9,
+                generation: 1,
+            },
+        ];
+
+        canonicalize_admission_handles(&mut handles);
+
+        let identities: Vec<_> = handles
+            .iter()
+            .map(|h| (h.job_id.as_str(), h.stage_id, h.generation))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("another", 9, 1),
+                ("job", 1, 4),
+                ("job", 3, 2),
+            ]
+        );
     }
 
     /// After `reset_tasks` marks a task as ResultLost, a late status update
