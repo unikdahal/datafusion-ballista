@@ -254,6 +254,46 @@ fn select_output_partitions(
     plan: &Arc<dyn ExecutionPlan>,
     indices: &[usize],
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if let Some(reader) =
+        plan.downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
+    {
+        let selected = indices
+            .iter()
+            .map(|index| {
+                reader
+                    .upstream_partition_ids
+                    .get(*index)
+                    .copied()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Plan(
+                            "pipelined reader partition out of bounds".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let partitioning = match reader.properties().output_partitioning() {
+            Partitioning::Hash(exprs, _) => {
+                Partitioning::Hash(exprs.clone(), selected.len())
+            }
+            Partitioning::RoundRobinBatch(_) => {
+                Partitioning::RoundRobinBatch(selected.len())
+            }
+            Partitioning::UnknownPartitioning(_) => {
+                Partitioning::UnknownPartitioning(selected.len())
+            }
+            Partitioning::Range(_) => {
+                return internal_err!("pipelined range shuffle is unsupported");
+            }
+        };
+        return Ok(Some(Arc::new(
+            ballista_core::execution_plans::PipelinedShuffleReaderExec::try_new(
+                reader.handle.clone(),
+                selected,
+                reader.schema(),
+                partitioning,
+            )?,
+        )));
+    }
     // ShuffleReaderExec: cross-stage inputs.
     if let Some(reader) = plan.downcast_ref::<ShuffleReaderExec>() {
         // Broadcast readers serve everything from partition[0] for every
@@ -403,6 +443,40 @@ fn select_output_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pipelined_reader_keeps_global_identity_under_restriction() -> Result<()> {
+        use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+        let reader: Arc<dyn ExecutionPlan> =
+            Arc::new(PipelinedShuffleReaderExec::try_new(
+                ShuffleInputHandle {
+                    job_id: "job".into(),
+                    stage_id: 1,
+                    generation: 7,
+                },
+                (0..8).collect(),
+                Arc::new(Schema::empty()),
+                Partitioning::UnknownPartitioning(8),
+            )?);
+        let restricted = restrict_plan_to_partitions(reader.clone(), &[2, 6])?;
+        let sliced = restricted
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .unwrap();
+        assert_eq!(sliced.upstream_partition_ids, vec![2, 6]);
+        assert_eq!(sliced.properties().partitioning.partition_count(), 2);
+        let collapsed: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(reader));
+        let restricted = restrict_plan_to_partitions(collapsed, &[0])?;
+        assert_eq!(
+            restricted.children()[0]
+                .downcast_ref::<PipelinedShuffleReaderExec>()
+                .unwrap()
+                .upstream_partition_ids
+                .len(),
+            8
+        );
+        Ok(())
+    }
     use ballista_core::JobId;
     use ballista_core::execution_plans::{
         CoalescePlan, PartitionGroup, ShuffleReaderExec,
