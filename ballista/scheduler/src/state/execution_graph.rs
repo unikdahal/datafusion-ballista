@@ -469,6 +469,37 @@ impl StaticExecutionGraph {
         Ok(())
     }
 
+    fn running_stage_for_admission_id(
+        &self,
+        black_list: &[usize],
+        tail: bool,
+    ) -> Option<usize> {
+        use super::execution_stage::StageAdmission;
+
+        self.stages
+            .iter()
+            .filter_map(|(id, stage)| {
+                let ExecutionStage::Running(stage) = stage else {
+                    return None;
+                };
+                if black_list.contains(id) || stage.pending.is_empty() {
+                    return None;
+                }
+                let eligible = match &stage.admission {
+                    StageAdmission::Normal => !tail,
+                    StageAdmission::TailPipelined(inputs) => {
+                        if self.input_histories_ready(inputs, true) {
+                            !tail
+                        } else {
+                            tail && self.input_histories_ready(inputs, false)
+                        }
+                    }
+                };
+                eligible.then_some(*id)
+            })
+            .min()
+    }
+
     fn pipelining_enabled(&self) -> bool {
         PIPELINED_SHUFFLE_RECOVERY_READY
             && self.session_config.ballista_shuffle_pipelined_enabled()
@@ -1592,8 +1623,6 @@ impl ExecutionGraph for StaticExecutionGraph {
         black_list: &[usize],
         tail: bool,
     ) -> Option<&mut RunningStage> {
-        use super::execution_stage::StageAdmission;
-
         if !self.pipelining_enabled() {
             return if tail {
                 None
@@ -1618,31 +1647,17 @@ impl ExecutionGraph for StaticExecutionGraph {
             return None;
         }
 
-        let selected = self
-            .stages
-            .iter()
-            .filter_map(|(id, stage)| {
-                let ExecutionStage::Running(stage) = stage else {
-                    return None;
-                };
-                if black_list.contains(id) || stage.pending.is_empty() {
-                    return None;
-                }
-                let eligible = match &stage.admission {
-                    StageAdmission::Normal => !tail,
-                    StageAdmission::TailPipelined(inputs) => {
-                        if self.input_histories_ready(inputs, true) {
-                            !tail
-                        } else {
-                            tail && self.input_histories_ready(inputs, false)
-                        }
-                    }
-                };
-                eligible.then_some(*id)
-            })
-            .min()?;
+        let mut selected = self.running_stage_for_admission_id(black_list, tail);
 
-        match self.stages.get_mut(&selected) {
+        // Preserve the legacy scheduler's liveness transition: a fresh graph
+        // starts with source stages in Resolved state, and normal scheduling is
+        // responsible for reviving them before the first task can be bound.
+        // Tail admission never revives stages on its own.
+        if selected.is_none() && !tail && self.revive() {
+            selected = self.running_stage_for_admission_id(black_list, false);
+        }
+
+        match selected.and_then(|id| self.stages.get_mut(&id)) {
             Some(ExecutionStage::Running(stage)) => Some(stage),
             _ => None,
         }
