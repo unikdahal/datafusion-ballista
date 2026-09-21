@@ -1263,6 +1263,7 @@ impl SuccessfulStage {
             Some(self.stage_metrics.clone())
         };
         RunningStage {
+            admission: StageAdmission::from_plan(&self.plan),
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num + 1,
             partitions: self.partitions,
