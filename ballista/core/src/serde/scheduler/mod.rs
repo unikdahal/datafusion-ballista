@@ -155,7 +155,7 @@ impl PartitionId {
 }
 
 /// Location information for a shuffle partition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionLocation {
     /// The source partition ID from the map stage.
     pub map_partition_id: usize,
@@ -384,7 +384,7 @@ impl ExecutorDataChange {
 }
 
 /// Summary of executed partition
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct PartitionStats {
     pub(crate) num_rows: Option<u64>,
     pub(crate) num_batches: Option<u64>,

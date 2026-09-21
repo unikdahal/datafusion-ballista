@@ -50,6 +50,8 @@ pub mod execution_stage;
 pub mod executor_manager;
 /// Session state management.
 pub mod session_manager;
+/// Generation-pinned, committed shuffle metadata.
+pub mod shuffle_input;
 /// Per-task plan rewriter (restrict scan/shuffle-reader to task's slice).
 pub mod task_builder;
 /// Task scheduling and lifecycle management.
