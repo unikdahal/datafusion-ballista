@@ -309,7 +309,7 @@ mod tests {
     fn location(task: usize, partition: usize) -> PartitionLocation {
         PartitionLocation {
             map_partition_id: task,
-            partition_id: PartitionId::new(&"job".to_owned(), 1, partition),
+            partition_id: PartitionId::new(&JobId::from("job"), 1, partition),
             executor_meta: ExecutorMetadata {
                 id: "executor".into(),
                 host: "localhost".into(),
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn atomic_commit_replay_conflict_and_seal() -> Result<()> {
-        let job = "job".to_owned();
+        let job = JobId::from("job");
         let mut registry = ShuffleInputRegistry::default();
         registry.create(&job, 1);
         let blocks = vec![location(0, 0), location(0, 1)];
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn rollover_preserves_survivors_and_rejects_stale_attempts() -> Result<()> {
-        let job = "job".to_owned();
+        let job = JobId::from("job");
         let mut registry = ShuffleInputRegistry::default();
         registry.create(&job, 1);
         registry.commit(&job, 1, 1, 0, vec![location(0, 0), location(0, 1)])?;
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn empty_producing_input_is_not_sealed() -> Result<()> {
-        let job = "job".to_owned();
+        let job = JobId::from("job");
         let mut registry = ShuffleInputRegistry::default();
         registry.create(&job, 1);
         let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 1, 0, &[0])?
