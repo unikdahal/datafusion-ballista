@@ -1046,18 +1046,6 @@ impl ExecutionGraph for StaticExecutionGraph {
                             successful_task,
                         )) = status
                         {
-                            if !running_stage
-                                .can_update_task_info(task_id, &task_status_for_update)
-                            {
-                                continue;
-                            }
-
-                            // Prepare every fallible side effect before accepting
-                            // task success. Once preparation succeeds, the graph
-                            // update and registry commit below are infallible.
-                            let prepared_metrics = running_stage
-                                .prepare_task_metrics(task_id, operator_metrics)?;
-
                             let SuccessfulTask {
                                 partitions,
                                 runtime_stats,
@@ -1068,43 +1056,78 @@ impl ExecutionGraph for StaticExecutionGraph {
                                 &job_id, task_id, stage_id, executor, partitions,
                             );
 
-                            // Generation identifies the consumer-visible metadata
-                            // history, not a producer task attempt. A still-valid
-                            // in-flight task publishes into the current generation
-                            // after rollover; reset/lost tasks are rejected above
-                            // before they can reach publication.
                             let mut registry = self.shuffle_inputs.lock();
-                            let prepared_commit = if let Some(generation) =
-                                registry
-                                    .get(&job_id, stage_id)
-                                    .map(|state| state.generation())
+                            if let Some(generation) = registry
+                                .get(&job_id, stage_id)
+                                .map(|state| state.generation())
                             {
-                                Some(registry.prepare_commit(
+                                // The pipelined path must validate every
+                                // fallible side effect before accepting task
+                                // success. Keep the registry lock across
+                                // prepare -> graph transition -> commit so the
+                                // prepared generation/version cannot change.
+                                if !running_stage.can_publish_task_success(
+                                    task_id,
+                                    &task_status_for_update,
+                                ) {
+                                    continue;
+                                }
+                                let prepared_metrics = running_stage
+                                    .prepare_task_metrics(task_id, operator_metrics)?;
+                                let prepared_commit = registry.prepare_commit(
                                     &job_id,
                                     stage_id,
                                     generation,
                                     task_id,
                                     committed.clone(),
-                                )?)
-                            } else {
-                                None
-                            };
+                                )?;
 
-                            running_stage.apply_task_info(
-                                task_id,
-                                task_status_for_update,
-                            );
-                            running_stage
-                                .apply_prepared_task_metrics(prepared_metrics);
-                            running_stage
-                                .append_runtime_stats_reports(task_id, runtime_stats);
-                            running_stage
-                                .append_window_state_reports(task_id, window_state);
-
-                            if let Some(prepared_commit) = prepared_commit {
+                                // Generation identifies the consumer-visible
+                                // metadata history, not a producer task
+                                // attempt. A still-valid in-flight task may
+                                // publish into the current generation after a
+                                // rollover; reset/lost tasks are rejected
+                                // above before publication.
+                                running_stage.apply_task_info(
+                                    task_id,
+                                    task_status_for_update,
+                                );
+                                running_stage.apply_prepared_task_metrics(
+                                    prepared_metrics,
+                                );
+                                running_stage.append_runtime_stats_reports(
+                                    task_id,
+                                    runtime_stats,
+                                );
+                                running_stage.append_window_state_reports(
+                                    task_id,
+                                    window_state,
+                                );
                                 registry.commit_prepared(prepared_commit);
+                                drop(registry);
+                            } else {
+                                // Feature off (or deliberately ineffective,
+                                // e.g. AQE still enabled): preserve the
+                                // pre-pipelining status/metrics/report ordering
+                                // and behavior exactly.
+                                drop(registry);
+                                if !running_stage.update_task_info(
+                                    task_id,
+                                    task_status_for_update,
+                                ) {
+                                    continue;
+                                }
+                                running_stage
+                                    .update_task_metrics(task_id, operator_metrics)?;
+                                running_stage.append_runtime_stats_reports(
+                                    task_id,
+                                    runtime_stats,
+                                );
+                                running_stage.append_window_state_reports(
+                                    task_id,
+                                    window_state,
+                                );
                             }
-                            drop(registry);
                             locations.append(&mut committed);
                         } else {
                             warn!(
