@@ -939,26 +939,57 @@ mod test {
                 .with_ballista_shuffle_pipelined_enabled(true)
                 .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1"),
         );
-        let mut graph =
+        let graph =
             test_aggregation_plan_with_config(4, job_id, session_config).await;
-        assert!(graph.revive(), "source stage should become runnable");
+        // Deliberately return the untouched builder result. The real binder
+        // must preserve the legacy Resolved -> Running revival transition.
         JobInfoCache::new(Box::new(graph))
     }
 
-    async fn commit_one_producer_task(cache: &JobInfoCache) -> Result<usize> {
-        let executor = mock_executor("producer".to_string());
+    async fn bind_one_for_job(
+        policy: TestBinder,
+        executor_id: &str,
+        job_id: &JobId,
+        cache: &JobInfoCache,
+    ) -> BoundTask {
+        let mut tasks = bind_with_policy(
+            policy,
+            single_budget(executor_id),
+            HashMap::from([(job_id.clone(), cache.clone())]),
+        )
+        .await;
+        assert_eq!(tasks.len(), 1, "expected exactly one bound task");
+        tasks.remove(0)
+    }
+
+    async fn complete_bound_task(
+        cache: &JobInfoCache,
+        bound: BoundTask,
+    ) -> Result<usize> {
+        let (executor_id, task) = bound;
+        let executor = mock_executor(executor_id);
+        let stage_id = task.key.stage_id;
         let mut graph = cache.execution_graph.write().await;
-        let task = graph
-            .pop_next_task(&executor.id)?
-            .expect("source stage should have a task");
-        let producer_stage = task.key.stage_id;
         graph.update_task_status(
             &executor,
             vec![mock_completed_task(task, &executor.id)],
             4,
             4,
         )?;
-        Ok(producer_stage)
+        Ok(stage_id)
+    }
+
+    async fn commit_one_producer_task(
+        policy: TestBinder,
+        job_id: &JobId,
+        cache: &JobInfoCache,
+    ) -> Result<usize> {
+        let bound = bind_one_for_job(policy, "producer", job_id, cache).await;
+        assert!(
+            !contains_pipelined_reader(&bound.1.plan),
+            "the first task from a fresh graph must be normal producer work"
+        );
+        complete_bound_task(cache, bound).await
     }
 
     fn contains_pipelined_reader(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> bool {
@@ -971,8 +1002,8 @@ mod test {
     }
 
     async fn assert_pipelined_binder_policy(policy: TestBinder) -> Result<()> {
-        // Feature-on jobs must still schedule their initial source work through
-        // the normal pass.
+        // Start from the untouched graph builder output: the normal binder pass
+        // itself must revive the initial Resolved source stage.
         let source_job: JobId = "source-normal".into();
         let source_cache = pipelined_job(&source_job).await;
         let source_tasks = bind_with_policy(
@@ -994,7 +1025,8 @@ mod test {
         // running and pending is empty, may spend spare capacity on the tail.
         let tail_job: JobId = "tail-gating".into();
         let tail_cache = pipelined_job(&tail_job).await;
-        let producer_stage = commit_one_producer_task(&tail_cache).await?;
+        let producer_stage =
+            commit_one_producer_task(policy, &tail_job, &tail_cache).await?;
         let tail_jobs = HashMap::from([(tail_job.clone(), tail_cache)]);
         let producer_tasks = bind_with_policy(
             policy,
@@ -1024,7 +1056,8 @@ mod test {
         // iteration order.
         let ready_tail_job: JobId = "ready-tail".into();
         let ready_tail_cache = pipelined_job(&ready_tail_job).await;
-        let _ = commit_one_producer_task(&ready_tail_cache).await?;
+        let _ =
+            commit_one_producer_task(policy, &ready_tail_job, &ready_tail_cache).await?;
         let ready_tail_only =
             HashMap::from([(ready_tail_job.clone(), ready_tail_cache.clone())]);
         let drained = bind_with_policy(
@@ -1050,39 +1083,35 @@ mod test {
         );
         assert!(!contains_pipelined_reader(&selected[0].1.plan));
 
-        // After the producer seals, the blocking resolver owns the consumer and
-        // the binder must see an ordinary reader rather than a tail reader.
+        // Complete the source stage exclusively through real binder calls. The
+        // next bind must revive the completion-barrier consumer as normal work,
+        // without any test-only graph.revive() call.
         let sealed_job: JobId = "sealed-input".into();
         let sealed_cache = pipelined_job(&sealed_job).await;
-        let graph_ref = sealed_cache.execution_graph.clone();
-        let sealed_executor = mock_executor("sealed-producer".to_string());
-        let producer_stage = {
-            let mut graph = graph_ref.write().await;
-            let mut task = graph
-                .pop_next_task(&sealed_executor.id)?
-                .expect("source stage should have a task");
-            let producer_stage = task.key.stage_id;
-            loop {
-                assert_eq!(task.key.stage_id, producer_stage);
-                graph.update_task_status(
-                    &sealed_executor,
-                    vec![mock_completed_task(task, &sealed_executor.id)],
-                    4,
-                    4,
-                )?;
-                if graph.completed_stages() > 0 {
-                    break;
-                }
-                task = graph
-                    .pop_next_task(&sealed_executor.id)?
-                    .expect("producer should still have pending work");
-            }
+        let mut producer_stage = None;
+        loop {
+            let bound =
+                bind_one_for_job(policy, "sealed-producer", &sealed_job, &sealed_cache)
+                    .await;
             assert!(
-                graph.revive(),
-                "sealed producer should resolve its consumer normally"
+                !contains_pipelined_reader(&bound.1.plan),
+                "producer completion path must remain normal work"
             );
-            producer_stage
-        };
+            let stage_id = bound.1.key.stage_id;
+            if let Some(expected) = producer_stage {
+                assert_eq!(stage_id, expected);
+            } else {
+                producer_stage = Some(stage_id);
+            }
+            complete_bound_task(&sealed_cache, bound).await?;
+
+            let graph = sealed_cache.execution_graph.read().await;
+            if graph.completed_stages() > 0 {
+                break;
+            }
+        }
+
+        let producer_stage = producer_stage.expect("expected a producer stage");
         let sealed_tasks = bind_with_policy(
             policy,
             single_budget("sealed-consumer"),
