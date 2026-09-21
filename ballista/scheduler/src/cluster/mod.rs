@@ -925,11 +925,19 @@ mod test {
         }
     }
 
-    fn single_budget(executor_id: &str) -> Vec<AvailableVcores> {
+    fn budget(executor_id: &str, vcores: u32) -> Vec<AvailableVcores> {
         vec![AvailableVcores {
             executor_id: executor_id.to_string(),
-            vcores: 1,
+            vcores,
         }]
+    }
+
+    fn single_budget(executor_id: &str) -> Vec<AvailableVcores> {
+        budget(executor_id, 1)
+    }
+
+    async fn pending_normal_tasks(cache: &JobInfoCache) -> usize {
+        cache.execution_graph.read().await.available_tasks()
     }
 
     async fn pipelined_job(job_id: &JobId) -> JobInfoCache {
@@ -1028,17 +1036,32 @@ mod test {
         let producer_stage =
             commit_one_producer_task(policy, &tail_job, &tail_cache).await?;
         let tail_jobs = HashMap::from([(tail_job.clone(), tail_cache)]);
+        let remaining = pending_normal_tasks(
+            tail_jobs.get(&tail_job).expect("tail job cache"),
+        )
+        .await;
+        assert!(
+            remaining > 0,
+            "fixture must retain producer pending work after the first commit"
+        );
         let producer_tasks = bind_with_policy(
             policy,
-            single_budget("producer-straggler"),
+            budget("producer-stragglers", remaining as u32),
             tail_jobs.clone(),
         )
         .await;
-        assert_eq!(producer_tasks.len(), 1);
-        assert_eq!(producer_tasks[0].1.key.stage_id, producer_stage);
+        assert_eq!(producer_tasks.len(), remaining);
         assert!(
-            !contains_pipelined_reader(&producer_tasks[0].1.plan),
+            producer_tasks
+                .iter()
+                .all(|(_, task)| task.key.stage_id == producer_stage),
             "committed history must not bypass unassigned producer work"
+        );
+        assert!(
+            producer_tasks
+                .iter()
+                .all(|(_, task)| !contains_pipelined_reader(&task.plan)),
+            "all remaining producer work must stay on the normal path"
         );
 
         let tail_tasks =
@@ -1060,13 +1083,21 @@ mod test {
             commit_one_producer_task(policy, &ready_tail_job, &ready_tail_cache).await?;
         let ready_tail_only =
             HashMap::from([(ready_tail_job.clone(), ready_tail_cache.clone())]);
+        let remaining =
+            pending_normal_tasks(&ready_tail_cache).await;
+        assert!(remaining > 0);
         let drained = bind_with_policy(
             policy,
-            single_budget("ready-tail-producer"),
+            budget("ready-tail-producers", remaining as u32),
             ready_tail_only,
         )
         .await;
-        assert_eq!(drained.len(), 1);
+        assert_eq!(drained.len(), remaining);
+        assert!(
+            drained
+                .iter()
+                .all(|(_, task)| !contains_pipelined_reader(&task.plan))
+        );
 
         let normal_job: JobId = "other-normal".into();
         let normal_cache = pipelined_job(&normal_job).await;
