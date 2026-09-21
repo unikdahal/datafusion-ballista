@@ -887,20 +887,34 @@ impl RunningStage {
             );
             return false;
         }
+        if status.status.is_none() {
+            warn!("Ignore TaskStatus update for task_id {task_id} with no status");
+            return false;
+        }
+        true
+    }
+
+    /// Stronger success-validation used only when pipelined shuffle metadata
+    /// will be published. The legacy feature-off path intentionally retains
+    /// its existing status-update behavior.
+    pub(crate) fn can_publish_task_success(
+        &self,
+        task_id: usize,
+        status: &TaskStatus,
+    ) -> bool {
+        if !self.can_update_task_info(task_id, status) {
+            return false;
+        }
         if matches!(
-            &task_info.task_status,
+            &self.task_infos[task_id].task_status,
             task_status::Status::Successful(_)
         ) && matches!(
             status.status.as_ref(),
             Some(task_status::Status::Successful(_))
         ) {
             debug!(
-                "Ignore replayed successful TaskStatus for task_id {task_id}; terminal success is immutable"
+                "Ignore replayed successful TaskStatus for task_id {task_id}; shuffle publication is already committed"
             );
-            return false;
-        }
-        if status.status.is_none() {
-            warn!("Ignore TaskStatus update for task_id {task_id} with no status");
             return false;
         }
         true
@@ -1660,13 +1674,16 @@ mod tests {
     }
 
     #[test]
-    fn test_update_task_info_success_replay_is_idempotent() {
+    fn test_pipelined_success_replay_is_rejected_without_changing_legacy_update() {
         let mut stage = make_running_stage(2);
         append_running_task(&mut stage, 0, "executor-1", vec![0]);
 
         let status = make_task_status(0);
         assert!(stage.update_task_info(0, status.clone()));
-        assert!(!stage.update_task_info(0, status));
+        assert!(!stage.can_publish_task_success(0, &status));
+
+        // The ordinary status-update API keeps the pre-feature behavior.
+        assert!(stage.update_task_info(0, status));
         assert_eq!(stage.successful_tasks(), 1);
         assert_eq!(stage.task_failure_numbers[0], 0);
     }
