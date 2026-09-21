@@ -889,6 +889,19 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     )
                 }
                 ShuffleInputRead::Update(update) => {
+                    // Also releases waiting pull-scheduled consumers, which may
+                    // not expose an executor cancellation RPC. For the
+                    // Open/PollShuffleInput protocol, gRPC ABORTED is reserved
+                    // exclusively for this admission-revocation control signal;
+                    // other scheduler/transport failures must use their normal
+                    // status codes so the reader cannot misclassify them.
+                    if update.lifecycle == ShuffleInputLifecycle::Producing {
+                        let graph = graph.read().await;
+                        if matches!(graph.stages().get(&stage), Some(crate::state::execution_stage::ExecutionStage::Running(producer)) if !producer.pending.is_empty())
+                        {
+                            return Err(Status::aborted("producer work reopened"));
+                        }
+                    }
                     if update.version == after
                         && update.lifecycle == ShuffleInputLifecycle::Producing
                         && tokio::time::Instant::now() < deadline
