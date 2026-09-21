@@ -390,7 +390,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             .unwrap()
             .as_millis() as u64;
         debug!("Start to run task {task_identity}");
-        let task = curator_task.task;
+        let mut task = curator_task.task;
+        if let Ok(client) = self.get_scheduler_client(&curator_task.scheduler_id).await {
+            task.session_config = task.session_config.with_extension(Arc::new(
+                ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime(Arc::new(client)),
+            ));
+        }
 
         let task_id = task.task_id;
         let job_id = task.job_id;
