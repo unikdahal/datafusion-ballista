@@ -352,6 +352,7 @@ impl ShuffleInputRegistry {
         let Some(state) = self.get(job, stage) else {
             return Ok(false);
         };
+        let generation = state.generation;
         let lost: HashSet<_> = state
             .blocks
             .keys()
@@ -361,7 +362,7 @@ impl ShuffleInputRegistry {
         if lost.is_empty() {
             return Ok(false);
         }
-        self.invalidate(job, stage, state.generation, &lost)?;
+        self.invalidate(job, stage, generation, &lost)?;
         Ok(true)
     }
 
