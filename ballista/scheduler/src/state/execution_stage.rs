@@ -867,18 +867,14 @@ impl RunningStage {
         self.pending.remaining()
     }
 
-    /// Apply a status update for the task at `task_id` (its append slot in
-    /// `task_infos`).
-    ///
-    /// Rejects (returns false) if the task's status is already terminal
-    /// Failed with a lost/killed reason (i.e., `reset_tasks` moved its
-    /// partitions back to pending because the executor died) — a late
-    /// status from that attempt should be ignored.
-    ///
-    /// On success, updates the task's status and adjusts per-partition
-    /// failure counters using the task's `global_input_partition_ids`.
-    pub fn update_task_info(&mut self, task_id: usize, status: TaskStatus) -> bool {
-        debug!("Updating TaskInfo for task_id {task_id}");
+    /// Check whether a task status may still be accepted without mutating the
+    /// running stage. Pipelined shuffle publication uses this before preparing
+    /// a registry commit so a rejected late status can never publish data.
+    pub(crate) fn can_update_task_info(
+        &self,
+        task_id: usize,
+        status: &TaskStatus,
+    ) -> bool {
         let task_info = &self.task_infos[task_id];
         if let task_status::Status::Failed(FailedTask {
             failed_reason:
@@ -903,10 +899,38 @@ impl RunningStage {
             );
             return false;
         }
+        if status.status.is_none() {
+            warn!("Ignore TaskStatus update for task_id {task_id} with no status");
+            return false;
+        }
+        true
+    }
+
+    /// Apply a status update for the task at `task_id` (its append slot in
+    /// `task_infos`). Returns false when the status is stale/replayed and was
+    /// intentionally ignored.
+    pub fn update_task_info(&mut self, task_id: usize, status: TaskStatus) -> bool {
+        debug!("Updating TaskInfo for task_id {task_id}");
+        if !self.can_update_task_info(task_id, &status) {
+            return false;
+        }
+        self.apply_task_info(task_id, status);
+        true
+    }
+
+    /// Apply a status that has already passed `can_update_task_info`.
+    ///
+    /// This is deliberately infallible: the pipelined publication transaction
+    /// performs every fallible validation first, then updates graph state and
+    /// commits the prepared registry mutation while holding the registry lock.
+    pub(crate) fn apply_task_info(&mut self, task_id: usize, status: TaskStatus) {
+        let task_info = &self.task_infos[task_id];
         let scheduled_time = task_info.scheduled_time;
         let global_input_partition_ids = task_info.global_input_partition_ids.clone();
         let vcores_consumed = task_info.vcores_consumed;
-        let task_status = status.status.unwrap();
+        let task_status = status
+            .status
+            .expect("TaskStatus was validated before apply_task_info");
         let updated_task_info = TaskInfo {
             task_id,
             scheduled_time,
@@ -936,7 +960,6 @@ impl RunningStage {
             }
             _ => {}
         }
-        true
     }
 
     /// Accumulate the `RuntimeStatsReport`s a successful task shipped
@@ -985,21 +1008,23 @@ impl RunningStage {
             }));
     }
 
-    /// update and upsert the task metrics to the stage metrics
-    pub fn update_task_metrics(
-        &mut self,
+    /// Prepare the post-success metrics snapshot without mutating the stage.
+    ///
+    /// Any malformed metric payload is rejected here, before shuffle metadata
+    /// is published or the task is marked successful.
+    pub(crate) fn prepare_task_metrics(
+        &self,
         task_id: usize,
         metrics: Vec<OperatorMetricsSet>,
-    ) -> Result<()> {
-        // For some cases, task metrics not set, especially for testings.
+    ) -> Result<Option<Vec<MetricsSet>>> {
         if metrics.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let global_partitions =
             self.task_infos[task_id].global_input_partition_ids.clone();
 
-        let new_metrics_set = if let Some(combined_metrics) = &mut self.stage_metrics {
+        let new_metrics_set = if let Some(combined_metrics) = &self.stage_metrics {
             if metrics.len() != combined_metrics.len() {
                 return Err(BallistaError::Internal(format!(
                     "Error updating task metrics to stage {}, task metrics array size {} does not equal \
@@ -1016,7 +1041,7 @@ impl RunningStage {
                 .collect::<Result<Vec<_>>>()?;
 
             combined_metrics
-                .iter_mut()
+                .iter()
                 .zip(metrics_values_array)
                 .map(|(existing_metrics, new_task_metrics)| {
                     Self::upsert_metrics_set_for_task(
@@ -1032,8 +1057,27 @@ impl RunningStage {
                 .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
                 .collect::<Result<Vec<_>>>()?
         };
-        self.stage_metrics = Some(new_metrics_set);
 
+        Ok(Some(new_metrics_set))
+    }
+
+    pub(crate) fn apply_prepared_task_metrics(
+        &mut self,
+        prepared: Option<Vec<MetricsSet>>,
+    ) {
+        if let Some(metrics) = prepared {
+            self.stage_metrics = Some(metrics);
+        }
+    }
+
+    /// Update and upsert the task metrics to the stage metrics.
+    pub fn update_task_metrics(
+        &mut self,
+        task_id: usize,
+        metrics: Vec<OperatorMetricsSet>,
+    ) -> Result<()> {
+        let prepared = self.prepare_task_metrics(task_id, metrics)?;
+        self.apply_prepared_task_metrics(prepared);
         Ok(())
     }
 
@@ -1115,7 +1159,7 @@ impl RunningStage {
     /// snapshots, so any prior entry for one of the task's global partitions
     /// is replaced by the new snapshot.
     pub fn upsert_metrics_set_for_task(
-        existing_metrics: &mut MetricsSet,
+        existing_metrics: &MetricsSet,
         new_task_metrics: MetricsSet,
         global_partitions: &[usize],
     ) -> MetricsSet {
