@@ -244,6 +244,9 @@ pub trait SessionConfigExt {
 
     /// Is adaptive query planner enabled
     fn ballista_adaptive_query_planner_enabled(&self) -> bool;
+    /// Enable experimental static pipelined shuffle.
+    fn ballista_shuffle_pipelined_enabled(&self) -> bool;
+    fn with_ballista_shuffle_pipelined_enabled(self, enabled: bool) -> Self;
 
     /// Enables or disables adaptive query planning (enabled by default).
     fn with_ballista_adaptive_query_planner(self, enabled: bool) -> Self;
@@ -622,6 +625,11 @@ impl SessionConfigExt for SessionConfig {
     );
 
     ballista_config_option!(bool, use_tls, BALLISTA_CLIENT_USE_TLS);
+    ballista_config_option!(
+        bool,
+        shuffle_pipelined_enabled,
+        BALLISTA_SHUFFLE_PIPELINED_ENABLED
+    );
 
     ballista_config_option!(bool, coalesce_enabled, BALLISTA_COALESCE_ENABLED);
 

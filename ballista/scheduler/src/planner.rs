@@ -798,12 +798,61 @@ pub fn remove_unresolved_shuffles(
 /// range-ness is a derived property of the child's declared ordering at plan
 /// time, not intrinsic reader metadata. Re-planning walks the adapter, which
 /// re-detects the ordering and plants a fresh `RangeShuffleReaderExec`.
+pub fn resolve_pipelined_shuffles(
+    plan: Arc<dyn ExecutionPlan>,
+    handles: &std::collections::HashMap<
+        usize,
+        ballista_core::serde::protobuf::ShuffleInputHandle,
+    >,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+        if reader.broadcast
+            || reader.coalesce.is_some()
+            || matches!(
+                reader.properties().partitioning,
+                datafusion::physical_plan::Partitioning::Range(_)
+            )
+        {
+            return Err(ballista_core::error::BallistaError::Internal(
+                "ineligible pipelined shuffle edge".into(),
+            ));
+        }
+        let handle = handles.get(&reader.stage_id).ok_or_else(|| {
+            ballista_core::error::BallistaError::Internal(
+                "missing shuffle generation".into(),
+            )
+        })?;
+        return Ok(Arc::new(
+            ballista_core::execution_plans::PipelinedShuffleReaderExec::try_new(
+                handle.clone(),
+                (0..reader.output_partition_count).collect(),
+                reader.schema(),
+                reader.properties().partitioning.clone(),
+            )?,
+        ));
+    }
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| resolve_pipelined_shuffles(child.clone(), handles))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(replace_children_if_necessary(plan, children)?)
+}
+
 pub fn rollback_resolved_shuffles(
     stage: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
-        if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
+        if let Some(reader) = child
+            .downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>(
+        ) {
+            new_children.push(Arc::new(UnresolvedShuffleExec::new(
+                reader.handle.stage_id as usize,
+                reader.schema(),
+                reader.properties().partitioning.clone(),
+            )));
+        } else if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
             let stage_id = shuffle_reader.stage_id;
             let unresolved = if shuffle_reader.broadcast {
                 Arc::new(UnresolvedShuffleExec::new_broadcast(

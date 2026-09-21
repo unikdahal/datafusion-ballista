@@ -33,6 +33,7 @@ use ballista_core::execution_plans::{
     RangeShuffleWriterExec, ShuffleWriter, ShuffleWriterExec, SortShuffleWriterExec,
     UnresolvedShuffleExec,
 };
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{FailedJob, ShuffleWritePartition, job_status};
@@ -341,6 +342,60 @@ pub struct RunningTaskInfo {
 }
 
 impl StaticExecutionGraph {
+    fn pipelining_enabled(&self) -> bool {
+        self.session_config.ballista_shuffle_pipelined_enabled()
+            && !self
+                .session_config
+                .ballista_adaptive_query_planner_enabled()
+    }
+
+    /// Eligibility is structural. Admission separately checks producer pending work.
+    fn pipelined_handles(
+        &self,
+        stage: &UnresolvedStage,
+    ) -> Option<HashMap<usize, ballista_core::serde::protobuf::ShuffleInputHandle>> {
+        if !self.pipelining_enabled()
+            || stage.output_links.is_empty()
+            || stage.inputs.is_empty()
+        {
+            return None;
+        }
+        fn eligible(plan: &dyn ExecutionPlan) -> bool {
+            if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+                return !reader.broadcast
+                    && reader.coalesce.is_none()
+                    && !matches!(
+                        reader.properties().partitioning,
+                        datafusion::physical_plan::Partitioning::Range(_)
+                    );
+            }
+            !plan.is::<RangeShuffleWriterExec>()
+                && plan.children().iter().all(|child| eligible(child.as_ref()))
+        }
+        if !eligible(stage.plan.as_ref()) {
+            return None;
+        }
+        let registry = self.shuffle_inputs.lock();
+        stage
+            .inputs
+            .keys()
+            .map(|producer| {
+                let producer_plan = self.stages.get(producer)?.plan();
+                if producer_plan.is::<RangeShuffleWriterExec>() {
+                    return None;
+                }
+                let state = registry.get(&self.job_id, *producer)?;
+                Some((
+                    *producer,
+                    ballista_core::serde::protobuf::ShuffleInputHandle {
+                        job_id: self.job_id.to_string(),
+                        stage_id: *producer as u32,
+                        generation: state.generation(),
+                    },
+                ))
+            })
+            .collect()
+    }
     /// Creates a new `ExecutionGraph` from a physical execution plan.
     ///
     /// This will use the `DistributedPlanner` to break the plan into stages
@@ -363,10 +418,19 @@ impl StaticExecutionGraph {
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
 
+        let mut shuffle_inputs = super::shuffle_input::ShuffleInputRegistry::default();
+        if session_config.ballista_shuffle_pipelined_enabled()
+            && !session_config.ballista_adaptive_query_planner_enabled()
+        {
+            for stage_id in stages.keys() {
+                shuffle_inputs.create(job_id, *stage_id);
+            }
+        }
+
         let started_at = timestamp_millis();
 
         Ok(Self {
-            shuffle_inputs: Arc::new(parking_lot::Mutex::new(Default::default())),
+            shuffle_inputs: Arc::new(parking_lot::Mutex::new(shuffle_inputs)),
             scheduler_id: Some(scheduler_id.to_string()),
             job_id: job_id.to_owned(),
             job_name: job_name.to_owned(),
@@ -810,7 +874,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
-                        if task_stage_attempt_num < running_stage.stage_attempt_num {
+                        if task_stage_attempt_num != running_stage.stage_attempt_num {
                             warn!(
                                 "Ignore TaskStatus update with TID {} as it's from Stage {}.{} and there is a more recent stage attempt {}.{} running",
                                 task_status.task_id,
@@ -979,9 +1043,22 @@ impl ExecutionGraph for StaticExecutionGraph {
                             running_stage
                                 .append_window_state_reports(task_id, window_state);
 
-                            locations.append(&mut partition_to_location(
+                            let mut committed = partition_to_location(
                                 &job_id, task_id, stage_id, executor, partitions,
-                            ));
+                            );
+                            let mut registry = self.shuffle_inputs.lock();
+                            if let Some(generation) =
+                                registry.get(&job_id, stage_id).map(|s| s.generation())
+                            {
+                                registry.commit(
+                                    &job_id,
+                                    stage_id,
+                                    generation,
+                                    task_id,
+                                    committed.clone(),
+                                )?;
+                            }
+                            locations.append(&mut committed);
                         } else {
                             warn!(
                                 "The task {task_identity}'s status is invalid for updating"
@@ -992,6 +1069,12 @@ impl ExecutionGraph for StaticExecutionGraph {
                     let is_final_successful = running_stage.is_successful()
                         && !reset_running_stages.contains_key(&stage_id);
                     if is_final_successful {
+                        let mut registry = self.shuffle_inputs.lock();
+                        if let Some(generation) =
+                            registry.get(&job_id, stage_id).map(|s| s.generation())
+                        {
+                            registry.seal(&job_id, stage_id, generation)?;
+                        }
                         successful_stages.insert(stage_id);
                         // if this stage is final successful, we want to combine the stage metrics to plan's metric set and print out the plan
                         if let Some(stage_metrics) = running_stage.stage_metrics.as_ref()

@@ -162,6 +162,8 @@ pub struct UnresolvedStage {
 /// then we call it as a resolved stage
 #[derive(Clone)]
 pub struct ResolvedStage {
+    /// Pinned input histories, reconstructed from the immutable physical plan.
+    pub admission: StageAdmission,
     /// Stage ID
     pub stage_id: usize,
     /// Stage Attempt number
@@ -189,6 +191,8 @@ pub struct ResolvedStage {
 ///    Running stages will only be maintained in memory and will not saved to the backend storage
 #[derive(Clone)]
 pub struct RunningStage {
+    /// Tail work is revocable while any pinned producer is unsealed.
+    pub admission: StageAdmission,
     /// Stage ID
     pub stage_id: usize,
     /// Stage Attempt number
@@ -541,6 +545,24 @@ impl UnresolvedStage {
             self.session_config.clone(),
         ))
     }
+
+    /// Resolve descriptors without completion-dependent optimizer rules.
+    pub fn to_pipelined_resolved(
+        &self,
+        handles: &HashMap<usize, ballista_core::serde::protobuf::ShuffleInputHandle>,
+    ) -> Result<ResolvedStage> {
+        let plan =
+            crate::planner::resolve_pipelined_shuffles(self.plan.clone(), handles)?;
+        Ok(ResolvedStage::new(
+            self.stage_id,
+            self.stage_attempt_num,
+            plan,
+            self.output_links.clone(),
+            self.inputs.clone(),
+            self.last_attempt_failure_reasons.clone(),
+            self.session_config.clone(),
+        ))
+    }
 }
 
 impl Debug for UnresolvedStage {
@@ -559,6 +581,37 @@ impl Debug for UnresolvedStage {
     }
 }
 
+/// Scheduling mode is independent of structural plan eligibility.
+#[derive(Debug, Clone, Default)]
+pub enum StageAdmission {
+    #[default]
+    Normal,
+    TailPipelined(Vec<ballista_core::serde::protobuf::ShuffleInputHandle>),
+}
+
+impl StageAdmission {
+    fn from_plan(plan: &Arc<dyn ExecutionPlan>) -> Self {
+        fn visit(
+            plan: &dyn ExecutionPlan,
+            inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
+        ) {
+            if let Some(reader) = plan.downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>() {
+                if !inputs.contains(&reader.handle) { inputs.push(reader.handle.clone()); }
+            }
+            for child in plan.children() {
+                visit(child.as_ref(), inputs);
+            }
+        }
+        let mut inputs = vec![];
+        visit(plan.as_ref(), &mut inputs);
+        if inputs.is_empty() {
+            Self::Normal
+        } else {
+            Self::TailPipelined(inputs)
+        }
+    }
+}
+
 impl ResolvedStage {
     /// Creates a new resolved stage ready for task scheduling.
     pub fn new(
@@ -573,6 +626,7 @@ impl ResolvedStage {
         let partitions = stage_input_partitions(&plan);
 
         Self {
+            admission: StageAdmission::from_plan(&plan),
             stage_id,
             stage_attempt_num,
             partitions,
@@ -638,6 +692,7 @@ impl RunningStage {
         session_config: Arc<SessionConfig>,
     ) -> Self {
         Self {
+            admission: StageAdmission::from_plan(&plan),
             stage_id,
             stage_attempt_num,
             stage_running_time: SystemTime::now()
