@@ -530,38 +530,42 @@ pub(crate) async fn bind_task_bias(
     budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
     let mut idx = 0usize;
-    for (job_id, job_info) in running_jobs.iter() {
-        if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
-            debug!("Job {job_id} is not in running status and will be skipped");
-            continue;
-        }
-        let mut graph = job_info.execution_graph.write().await;
-        let session_id = graph.session_id().to_string();
-        let mut black_list = vec![];
-        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
-            if if_skip(running_stage.plan.clone()) {
-                debug!(
-                    "Will skip stage {}/{} for bias task binding",
-                    job_id, running_stage.stage_id
-                );
-                black_list.push(running_stage.stage_id);
+    for tail in [false, true] {
+        for (job_id, job_info) in running_jobs.iter() {
+            if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
+                debug!("Job {job_id} is not in running status and will be skipped");
                 continue;
             }
-            while idx < budgets.len() {
-                while idx < budgets.len() && budgets[idx].vcores == 0 {
-                    idx += 1;
+            let mut graph = job_info.execution_graph.write().await;
+            let session_id = graph.session_id().to_string();
+            let mut black_list = vec![];
+            while let Some(running_stage) =
+                graph.fetch_running_stage_for_admission(&black_list, tail)
+            {
+                if if_skip(running_stage.plan.clone()) {
+                    debug!(
+                        "Will skip stage {}/{} for bias task binding",
+                        job_id, running_stage.stage_id
+                    );
+                    black_list.push(running_stage.stage_id);
+                    continue;
                 }
-                if idx >= budgets.len() {
-                    return schedulable_tasks;
-                }
-                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
-                    Some(bound) => schedulable_tasks.push(bound),
-                    None => break, // stage's pending is drained
+                while idx < budgets.len() {
+                    while idx < budgets.len() && budgets[idx].vcores == 0 {
+                        idx += 1;
+                    }
+                    if idx >= budgets.len() {
+                        return schedulable_tasks;
+                    }
+                    match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx])
+                    {
+                        Some(bound) => schedulable_tasks.push(bound),
+                        None => break, // stage's pending is drained
+                    }
                 }
             }
         }
     }
-
     schedulable_tasks
 }
 
@@ -583,43 +587,47 @@ pub(crate) async fn bind_task_round_robin(
     budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
     let mut idx = 0usize;
-    for (job_id, job_info) in running_jobs.iter() {
-        if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
-            debug!("Job {job_id} is not in running status and will be skipped");
-            continue;
-        }
-        let mut graph = job_info.execution_graph.write().await;
-        let session_id = graph.session_id().to_string();
-        let mut black_list = vec![];
-        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
-            if if_skip(running_stage.plan.clone()) {
-                debug!(
-                    "Will skip stage {}/{} for round robin task binding",
-                    job_id, running_stage.stage_id
-                );
-                black_list.push(running_stage.stage_id);
+    for tail in [false, true] {
+        for (job_id, job_info) in running_jobs.iter() {
+            if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
+                debug!("Job {job_id} is not in running status and will be skipped");
                 continue;
             }
-            loop {
-                let mut scanned = 0usize;
-                while budgets[idx].vcores == 0 {
-                    idx = (idx + 1) % budgets.len();
-                    scanned += 1;
-                    if scanned >= budgets.len() {
-                        return schedulable_tasks;
-                    }
+            let mut graph = job_info.execution_graph.write().await;
+            let session_id = graph.session_id().to_string();
+            let mut black_list = vec![];
+            while let Some(running_stage) =
+                graph.fetch_running_stage_for_admission(&black_list, tail)
+            {
+                if if_skip(running_stage.plan.clone()) {
+                    debug!(
+                        "Will skip stage {}/{} for round robin task binding",
+                        job_id, running_stage.stage_id
+                    );
+                    black_list.push(running_stage.stage_id);
+                    continue;
                 }
-                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
-                    Some(bound) => {
-                        schedulable_tasks.push(bound);
+                loop {
+                    let mut scanned = 0usize;
+                    while budgets[idx].vcores == 0 {
                         idx = (idx + 1) % budgets.len();
+                        scanned += 1;
+                        if scanned >= budgets.len() {
+                            return schedulable_tasks;
+                        }
                     }
-                    None => break, // stage's pending is drained
+                    match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx])
+                    {
+                        Some(bound) => {
+                            schedulable_tasks.push(bound);
+                            idx = (idx + 1) % budgets.len();
+                        }
+                        None => break, // stage's pending is drained
+                    }
                 }
             }
         }
     }
-
     schedulable_tasks
 }
 
@@ -672,7 +680,7 @@ mod test {
     use crate::state::execution_graph::{ExecutionGraph, StaticExecutionGraph};
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
-        mock_completed_task, revive_graph_and_complete_next_stage,
+        mock_completed_task, mock_executor, revive_graph_and_complete_next_stage,
         test_aggregation_plan_with_config,
     };
     use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
@@ -892,6 +900,213 @@ mod test {
                 vcores: 7,
             },
         ]
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestBinder {
+        Bias,
+        RoundRobin,
+    }
+
+    async fn bind_with_policy(
+        policy: TestBinder,
+        mut budgets: Vec<AvailableVcores>,
+        active_jobs: HashMap<JobId, JobInfoCache>,
+    ) -> Vec<BoundTask> {
+        let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
+        match policy {
+            TestBinder::Bias => {
+                bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false).await
+            }
+            TestBinder::RoundRobin => {
+                bind_task_round_robin(budgets_ref, Arc::new(active_jobs), |_| false)
+                    .await
+            }
+        }
+    }
+
+    fn single_budget(executor_id: &str) -> Vec<AvailableVcores> {
+        vec![AvailableVcores {
+            executor_id: executor_id.to_string(),
+            vcores: 1,
+        }]
+    }
+
+    async fn pipelined_job(job_id: &JobId) -> JobInfoCache {
+        let session_config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_adaptive_query_planner(false)
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1"),
+        );
+        let mut graph =
+            test_aggregation_plan_with_config(4, job_id, session_config).await;
+        assert!(graph.revive(), "source stage should become runnable");
+        JobInfoCache::new(Box::new(graph))
+    }
+
+    async fn commit_one_producer_task(cache: &JobInfoCache) -> Result<usize> {
+        let executor = mock_executor("producer".to_string());
+        let mut graph = cache.execution_graph.write().await;
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("source stage should have a task");
+        let producer_stage = task.key.stage_id;
+        graph.update_task_status(
+            &executor,
+            vec![mock_completed_task(task, &executor.id)],
+            4,
+            4,
+        )?;
+        Ok(producer_stage)
+    }
+
+    fn contains_pipelined_reader(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> bool {
+        if plan.is::<ballista_core::execution_plans::PipelinedShuffleReaderExec>() {
+            return true;
+        }
+        plan.children()
+            .iter()
+            .any(|child| contains_pipelined_reader(child))
+    }
+
+    async fn assert_pipelined_binder_policy(policy: TestBinder) -> Result<()> {
+        // Feature-on jobs must still schedule their initial source work through
+        // the normal pass.
+        let source_job: JobId = "source-normal".into();
+        let source_cache = pipelined_job(&source_job).await;
+        let source_tasks = bind_with_policy(
+            policy,
+            single_budget("source-exec"),
+            HashMap::from([(source_job.clone(), source_cache)]),
+        )
+        .await;
+        assert_eq!(source_tasks.len(), 1);
+        assert_eq!(source_tasks[0].1.key.job_id, source_job);
+        assert!(
+            !contains_pipelined_reader(&source_tasks[0].1.plan),
+            "initial source work must never be tail work"
+        );
+
+        // One committed producer task is not enough while producer work is
+        // still unassigned. The first binder pass must consume that normal
+        // producer partition. Only the following pass, while that partition is
+        // running and pending is empty, may spend spare capacity on the tail.
+        let tail_job: JobId = "tail-gating".into();
+        let tail_cache = pipelined_job(&tail_job).await;
+        let producer_stage = commit_one_producer_task(&tail_cache).await?;
+        let tail_jobs = HashMap::from([(tail_job.clone(), tail_cache)]);
+        let producer_tasks = bind_with_policy(
+            policy,
+            single_budget("producer-straggler"),
+            tail_jobs.clone(),
+        )
+        .await;
+        assert_eq!(producer_tasks.len(), 1);
+        assert_eq!(producer_tasks[0].1.key.stage_id, producer_stage);
+        assert!(
+            !contains_pipelined_reader(&producer_tasks[0].1.plan),
+            "committed history must not bypass unassigned producer work"
+        );
+
+        let tail_tasks =
+            bind_with_policy(policy, single_budget("tail-exec"), tail_jobs).await;
+        assert_eq!(tail_tasks.len(), 1);
+        assert_ne!(tail_tasks[0].1.key.stage_id, producer_stage);
+        assert!(
+            contains_pipelined_reader(&tail_tasks[0].1.plan),
+            "once producer pending is drained, spare capacity should admit the tail"
+        );
+
+        // Normal work is global-priority work, not merely per-job priority.
+        // Make one job tail-ready, then introduce a fresh job with normal source
+        // work. A single vcore must go to the fresh job regardless of HashMap
+        // iteration order.
+        let ready_tail_job: JobId = "ready-tail".into();
+        let ready_tail_cache = pipelined_job(&ready_tail_job).await;
+        let _ = commit_one_producer_task(&ready_tail_cache).await?;
+        let ready_tail_only =
+            HashMap::from([(ready_tail_job.clone(), ready_tail_cache.clone())]);
+        let drained = bind_with_policy(
+            policy,
+            single_budget("ready-tail-producer"),
+            ready_tail_only,
+        )
+        .await;
+        assert_eq!(drained.len(), 1);
+
+        let normal_job: JobId = "other-normal".into();
+        let normal_cache = pipelined_job(&normal_job).await;
+        let mixed_jobs = HashMap::from([
+            (ready_tail_job, ready_tail_cache),
+            (normal_job.clone(), normal_cache),
+        ]);
+        let selected =
+            bind_with_policy(policy, single_budget("global-priority"), mixed_jobs).await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].1.key.job_id, normal_job,
+            "normal work from another job must consume capacity before tail work"
+        );
+        assert!(!contains_pipelined_reader(&selected[0].1.plan));
+
+        // After the producer seals, the blocking resolver owns the consumer and
+        // the binder must see an ordinary reader rather than a tail reader.
+        let sealed_job: JobId = "sealed-input".into();
+        let sealed_cache = pipelined_job(&sealed_job).await;
+        let graph_ref = sealed_cache.execution_graph.clone();
+        let sealed_executor = mock_executor("sealed-producer".to_string());
+        let producer_stage = {
+            let mut graph = graph_ref.write().await;
+            let mut task = graph
+                .pop_next_task(&sealed_executor.id)?
+                .expect("source stage should have a task");
+            let producer_stage = task.key.stage_id;
+            loop {
+                assert_eq!(task.key.stage_id, producer_stage);
+                graph.update_task_status(
+                    &sealed_executor,
+                    vec![mock_completed_task(task, &sealed_executor.id)],
+                    4,
+                    4,
+                )?;
+                if graph.completed_stages() > 0 {
+                    break;
+                }
+                task = graph
+                    .pop_next_task(&sealed_executor.id)?
+                    .expect("producer should still have pending work");
+            }
+            assert!(
+                graph.revive(),
+                "sealed producer should resolve its consumer normally"
+            );
+            producer_stage
+        };
+        let sealed_tasks = bind_with_policy(
+            policy,
+            single_budget("sealed-consumer"),
+            HashMap::from([(sealed_job, sealed_cache)]),
+        )
+        .await;
+        assert_eq!(sealed_tasks.len(), 1);
+        assert_ne!(sealed_tasks[0].1.key.stage_id, producer_stage);
+        assert!(
+            !contains_pipelined_reader(&sealed_tasks[0].1.plan),
+            "sealed inputs must classify the consumer as normal work"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bind_task_bias_pipelined_admission() -> Result<()> {
+        assert_pipelined_binder_policy(TestBinder::Bias).await
+    }
+
+    #[tokio::test]
+    async fn test_bind_task_round_robin_pipelined_admission() -> Result<()> {
+        assert_pipelined_binder_policy(TestBinder::RoundRobin).await
     }
 
     /// Both shuffle reader kinds are stage boundaries — walking through them
