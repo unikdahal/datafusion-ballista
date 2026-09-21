@@ -341,6 +341,38 @@ pub struct RunningTaskInfo {
     pub executor_id: String,
 }
 
+/// Single source of truth for shuffle shapes that are safe for static
+/// pipelining. Keeping the matrix explicit prevents later planner additions
+/// from accidentally widening admission.
+fn pipelined_shape_eligible(
+    broadcast: bool,
+    coalesced: bool,
+    range_reader: bool,
+    range_writer: bool,
+) -> bool {
+    !broadcast && !coalesced && !range_reader && !range_writer
+}
+
+fn pipelined_plan_eligible(plan: &dyn ExecutionPlan) -> bool {
+    if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+        return pipelined_shape_eligible(
+            reader.broadcast,
+            reader.coalesce.is_some(),
+            matches!(
+                reader.properties().partitioning,
+                datafusion::physical_plan::Partitioning::Range(_)
+            ),
+            false,
+        );
+    }
+    if plan.is::<RangeShuffleWriterExec>() {
+        return pipelined_shape_eligible(false, false, false, true);
+    }
+    plan.children()
+        .iter()
+        .all(|child| pipelined_plan_eligible(child.as_ref()))
+}
+
 impl StaticExecutionGraph {
     fn pipelining_enabled(&self) -> bool {
         self.session_config.ballista_shuffle_pipelined_enabled()
@@ -360,19 +392,7 @@ impl StaticExecutionGraph {
         {
             return None;
         }
-        fn eligible(plan: &dyn ExecutionPlan) -> bool {
-            if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
-                return !reader.broadcast
-                    && reader.coalesce.is_none()
-                    && !matches!(
-                        reader.properties().partitioning,
-                        datafusion::physical_plan::Partitioning::Range(_)
-                    );
-            }
-            !plan.is::<RangeShuffleWriterExec>()
-                && plan.children().iter().all(|child| eligible(child.as_ref()))
-        }
-        if !eligible(stage.plan.as_ref()) {
+        if !pipelined_plan_eligible(stage.plan.as_ref()) {
             return None;
         }
         let registry = self.shuffle_inputs.lock();
@@ -1994,6 +2014,9 @@ mod test {
 
     use crate::scheduler_server::event::QueryStageSchedulerEvent;
     use ballista_core::error::{BallistaError, Result};
+    use ballista_core::extension::SessionConfigExt;
+    use ballista_core::execution_plans::UnresolvedShuffleExec;
+    use ballista_core::JobId;
     use ballista_core::serde::protobuf::{
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status, task_status,
@@ -2003,9 +2026,10 @@ mod test {
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
     };
+    use datafusion::prelude::SessionConfig;
 
     use crate::state::execution_graph::ExecutionGraph;
     use crate::state::execution_stage::ExecutionStage;
@@ -2013,13 +2037,77 @@ mod test {
         mock_completed_task, mock_executor, mock_failed_task,
         revive_graph_and_complete_next_stage,
         revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
-        test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
-        test_union_all_plan, test_union_plan,
+        test_aggregation_plan_with_config, test_coalesce_plan, test_join_plan,
+        test_two_aggregations_plan, test_union_all_plan, test_union_plan,
     };
 
     #[derive(Debug)]
     struct FailingPlanRewriteExec {
         input: Arc<dyn ExecutionPlan>,
+    }
+
+    #[derive(Debug)]
+    struct EligibilityChildrenExec {
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl EligibilityChildrenExec {
+        fn new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            assert!(!inputs.is_empty());
+            let properties = inputs[0].properties().clone();
+            Self { inputs, properties }
+        }
+    }
+
+    impl DisplayAs for EligibilityChildrenExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "EligibilityChildrenExec")
+        }
+    }
+
+    impl ExecutionPlan for EligibilityChildrenExec {
+        fn name(&self) -> &str {
+            "EligibilityChildrenExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.inputs.iter().collect()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(children)))
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            Err(DataFusionError::Plan(
+                "EligibilityChildrenExec is test-only".to_string(),
+            ))
+        }
     }
 
     impl DisplayAs for FailingPlanRewriteExec {
@@ -2221,6 +2309,84 @@ mod test {
             _ => panic!("expected the original running stage"),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipelined_shuffle_shape_eligibility_matrix() {
+        let cases = [
+            ("static", false, false, false, false, true),
+            ("broadcast", true, false, false, false, false),
+            ("coalesced", false, true, false, false, false),
+            ("range-reader", false, false, true, false, false),
+            ("range-writer", false, false, false, true, false),
+        ];
+
+        for (name, broadcast, coalesced, range_reader, range_writer, expected) in
+            cases
+        {
+            assert_eq!(
+                super::pipelined_shape_eligible(
+                    broadcast,
+                    coalesced,
+                    range_reader,
+                    range_writer,
+                ),
+                expected,
+                "unexpected eligibility for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipelined_plan_rejects_mixed_multi_input_when_one_edge_is_ineligible() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let eligible: Arc<dyn ExecutionPlan> = Arc::new(UnresolvedShuffleExec::new(
+            1,
+            schema.clone(),
+            Partitioning::UnknownPartitioning(2),
+        ));
+        let broadcast: Arc<dyn ExecutionPlan> =
+            Arc::new(UnresolvedShuffleExec::new_broadcast(2, schema, 2));
+
+        let all_static = EligibilityChildrenExec::new(vec![
+            eligible.clone(),
+            eligible.clone(),
+        ]);
+        assert!(super::pipelined_plan_eligible(&all_static));
+
+        let mixed = EligibilityChildrenExec::new(vec![eligible, broadcast]);
+        assert!(!super::pipelined_plan_eligible(&mixed));
+    }
+
+    #[tokio::test]
+    async fn test_final_stage_remains_behind_completion_barrier() -> Result<()> {
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-final-barrier");
+        let graph =
+            test_aggregation_plan_with_config(2, &job, config).await;
+
+        let final_stage = graph
+            .stages
+            .values()
+            .find_map(|stage| match stage {
+                ExecutionStage::UnResolved(stage)
+                    if stage.output_links.is_empty() && !stage.inputs.is_empty() =>
+                {
+                    Some(stage)
+                }
+                _ => None,
+            })
+            .expect("expected an unresolved final stage");
+
+        assert!(
+            graph.pipelined_handles(final_stage).is_none(),
+            "final stage must never be admitted before producer completion"
+        );
         Ok(())
     }
 
