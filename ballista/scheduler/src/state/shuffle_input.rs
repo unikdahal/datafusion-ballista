@@ -404,7 +404,7 @@ fn canonical_publication(
     }
 
     let mut publication: Vec<_> = by_key.into_values().collect();
-    publication.sort_by_key(ShuffleBlockKey::from);
+    publication.sort_by_key(|location| ShuffleBlockKey::from(location));
     Ok(publication)
 }
 
