@@ -105,6 +105,19 @@ impl ShuffleGenerationState {
     }
 }
 
+/// A fully validated registry mutation. The scheduler prepares this while
+/// holding the registry lock, performs the corresponding infallible graph
+/// transition, then applies the token before releasing the same lock.
+#[derive(Debug)]
+pub(crate) struct PreparedShuffleCommit {
+    job: JobId,
+    stage: usize,
+    generation: u64,
+    base_version: u64,
+    version: u64,
+    additions: HashMap<ShuffleBlockKey, PartitionLocation>,
+}
+
 /// Mutations are serialized by scheduler ownership. Never hold its lock while
 /// awaiting a notification. Register the notification *before* reading state.
 #[derive(Debug, Default)]
@@ -128,17 +141,21 @@ impl ShuffleInputRegistry {
         self.get(job, stage).map(|state| state.notify.clone())
     }
 
-    /// Validate the entire commit before changing any state. Exact replay does
-    /// not advance the version, including an accepted empty task result.
-    pub fn commit(
-        &mut self,
+    /// Validate the entire task publication without changing registry state.
+    ///
+    /// The returned token can be applied without semantic failure as long as
+    /// the caller keeps the same registry lock guard alive between prepare and
+    /// commit. Exact replay produces an empty token and does not advance the
+    /// version, including an accepted empty task result.
+    pub(crate) fn prepare_commit(
+        &self,
         job: &JobId,
         stage: usize,
         generation: u64,
         task: usize,
         locations: Vec<PartitionLocation>,
-    ) -> Result<u64> {
-        let state = self.current_mut(job, stage, generation)?;
+    ) -> Result<PreparedShuffleCommit> {
+        let state = self.current(job, stage, generation)?;
         let mut additions = HashMap::new();
         for location in locations {
             if location.partition_id.job_id != *job
@@ -161,27 +178,80 @@ impl ShuffleInputRegistry {
                 additions.insert(key, location);
             }
         }
-        if additions.is_empty() {
-            return Ok(state.version);
-        }
-        if state.lifecycle == ShuffleInputLifecycle::Sealed {
+
+        if !additions.is_empty() && state.lifecycle == ShuffleInputLifecycle::Sealed {
             return Err(invariant("publication after shuffle seal"));
         }
-        let version = increment(state.version)?;
-        state
-            .blocks
-            .extend(additions.into_iter().map(|(key, location)| {
-                (
-                    key,
-                    PublishedShuffleLocation {
-                        published_version: version,
-                        location,
-                    },
-                )
-            }));
-        state.version = version;
+
+        let version = if additions.is_empty() {
+            state.version
+        } else {
+            increment(state.version)?
+        };
+
+        Ok(PreparedShuffleCommit {
+            job: job.clone(),
+            stage,
+            generation,
+            base_version: state.version,
+            version,
+            additions,
+        })
+    }
+
+    /// Apply a commit that was validated by `prepare_commit`.
+    ///
+    /// This method is intentionally infallible. Its caller must retain the
+    /// registry lock across prepare -> graph transition -> commit, so the
+    /// generation/version checked below cannot legitimately change.
+    pub(crate) fn commit_prepared(&mut self, prepared: PreparedShuffleCommit) -> u64 {
+        let state = self
+            .inputs
+            .get_mut(&(prepared.job.clone(), prepared.stage))
+            .expect("prepared shuffle input disappeared while registry lock was held");
+        assert_eq!(
+            state.generation, prepared.generation,
+            "prepared shuffle generation changed while registry lock was held"
+        );
+        assert_eq!(
+            state.version, prepared.base_version,
+            "prepared shuffle version changed while registry lock was held"
+        );
+
+        if prepared.additions.is_empty() {
+            return state.version;
+        }
+
+        state.blocks.extend(
+            prepared
+                .additions
+                .into_iter()
+                .map(|(key, location)| {
+                    (
+                        key,
+                        PublishedShuffleLocation {
+                            published_version: prepared.version,
+                            location,
+                        },
+                    )
+                }),
+        );
+        state.version = prepared.version;
         state.notify.notify_waiters();
-        Ok(version)
+        state.version
+    }
+
+    /// Validate and commit in one call for non-transactional callers.
+    pub fn commit(
+        &mut self,
+        job: &JobId,
+        stage: usize,
+        generation: u64,
+        task: usize,
+        locations: Vec<PartitionLocation>,
+    ) -> Result<u64> {
+        let prepared = self.prepare_commit(job, stage, generation, task, locations)?;
+        Ok(self.commit_prepared(prepared))
     }
 
     /// Called only at the existing final-success stage transition.
@@ -270,6 +340,22 @@ impl ShuffleInputRegistry {
                 true
             }
         });
+    }
+
+    fn current(
+        &self,
+        job: &JobId,
+        stage: usize,
+        generation: u64,
+    ) -> Result<&ShuffleGenerationState> {
+        let state = self
+            .inputs
+            .get(&(job.clone(), stage))
+            .ok_or_else(|| invariant("shuffle input closed"))?;
+        if state.generation != generation {
+            return Err(invariant("stale shuffle generation publication"));
+        }
+        Ok(state)
     }
 
     fn current_mut(
