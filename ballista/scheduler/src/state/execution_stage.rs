@@ -628,9 +628,7 @@ fn canonicalize_admission_handles(
             .then_with(|| a.generation.cmp(&b.generation))
     });
     inputs.dedup_by(|a, b| {
-        a.job_id == b.job_id
-            && a.stage_id == b.stage_id
-            && a.generation == b.generation
+        a.job_id == b.job_id && a.stage_id == b.stage_id && a.generation == b.generation
     });
 }
 
@@ -1761,11 +1759,7 @@ mod tests {
             .collect();
         assert_eq!(
             identities,
-            vec![
-                ("another", 9, 1),
-                ("job", 1, 4),
-                ("job", 3, 2),
-            ]
+            vec![("another", 9, 1), ("job", 1, 4), ("job", 3, 2),]
         );
     }
 
