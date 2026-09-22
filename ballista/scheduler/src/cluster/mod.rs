@@ -24,7 +24,9 @@ use crate::state::execution_graph::{
 use crate::state::task_manager::JobInfoCache;
 use ballista_core::config::BallistaConfig;
 use ballista_core::error::Result;
-use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
+use ballista_core::execution_plans::{
+    PipelinedShuffleReaderExec, RangeShuffleReaderExec, ShuffleReaderExec,
+};
 use ballista_core::serde::protobuf::{
     AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
 };
@@ -371,7 +373,8 @@ pub trait JobState: Send + Sync {
 ///
 /// The stage-boundary stop enumerates the leaf readers that terminate a
 /// resolved stage plan: `ShuffleReaderExec` (regular / broadcast / coalesced)
-/// and `RangeShuffleReaderExec` (ordering-preserving). The *general* rule is
+/// `RangeShuffleReaderExec` (ordering-preserving), and
+/// `PipelinedShuffleReaderExec` (generation-pinned incremental input). The *general* rule is
 /// "stop at any stage boundary"; if new stage-boundary operators appear, add
 /// them here (or, better, get `ExecutionPlan` upstream to expose an
 /// `is_stage_boundary()` property so we don't keep enumerating).
@@ -379,6 +382,7 @@ fn stage_has_input_collapse(plan_root: &Arc<dyn ExecutionPlan>) -> bool {
     fn walk(node: &Arc<dyn ExecutionPlan>) -> bool {
         if node.downcast_ref::<ShuffleReaderExec>().is_some()
             || node.downcast_ref::<RangeShuffleReaderExec>().is_some()
+            || node.downcast_ref::<PipelinedShuffleReaderExec>().is_some()
         {
             return false;
         }
@@ -1258,6 +1262,39 @@ mod test {
     /// as soon as a reader is seen. Guard the range variant explicitly since
     /// `UnknownPartitioning(1)` would otherwise trigger the single-partition
     /// arm.
+    #[test]
+    fn stage_has_input_collapse_stops_at_pipelined_reader() {
+        use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::Partitioning;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+        // A one-partition reader is exactly the shape that the generic
+        // partition_count == 1 check would misclassify as an input collapse
+        // unless the new reader is recognized as a stage boundary.
+        let reader = Arc::new(
+            PipelinedShuffleReaderExec::try_new(
+                ShuffleInputHandle {
+                    job_id: "job".into(),
+                    stage_id: 1,
+                    generation: 1,
+                },
+                vec![0],
+                Arc::new(Schema::empty()),
+                Partitioning::UnknownPartitioning(1),
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let root: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(reader));
+
+        assert!(
+            !stage_has_input_collapse(&root),
+            "a pipelined shuffle reader is a stage boundary, not an input collapse",
+        );
+    }
+
     #[test]
     fn stage_has_input_collapse_stops_at_range_reader() {
         use ballista_core::execution_plans::RangeShuffleReaderExec;
