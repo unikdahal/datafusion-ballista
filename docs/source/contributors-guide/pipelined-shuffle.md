@@ -54,6 +54,8 @@ interface to support early scheduling.
 6. `shuffle/06-tail-scheduling`: normal-first admission using spare capacity.
 7. `shuffle/07-recovery`: revocation, invalidation, fan-out rollback, success barrier.
 8. `shuffle/08-validation`: regression coverage and documentation.
+9. `shuffle/review-hardening`: empty-publication recovery, task-report ownership,
+   exact replay handling, bounded transport retries, and executable job-lifecycle tests.
 
 Validation runs in the `Pipelined shuffle validation` GitHub Actions workflow.
 Pushes to the shuffle review branches rerun validation automatically; a manual
@@ -67,6 +69,12 @@ before producer seal. Recovery coverage then removes the executor that owns
 committed output while a pipelined reader is active, requires the pinned
 generation to become invalid, and verifies the retried query returns every row
 exactly once.
+
+The review follow-up also covers loss of empty publications, duplicate terminal
+reports, wrong-executor reports and refunds, exact versus conflicting metadata
+replays, retry cursors, and cancellation of an in-flight metadata request. After
+the reader's short transport retry loop is exhausted, temporary unavailability
+is reported as retryable task I/O and remains bounded by the scheduler retry policy.
 
 The ignored latency experiment uses non-blocking deterministic delay injection and
 reports repeated samples plus medians. It is diagnostic smoke coverage, not

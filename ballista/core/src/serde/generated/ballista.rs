@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -71,7 +71,20 @@ pub mod ballista_physical_plan_node {
         PrefixMerge(super::PrefixMergeExecNode),
         #[prost(message, tag = "15")]
         RangeShuffleWriter(super::RangeShuffleWriterExecNode),
+        #[prost(message, tag = "16")]
+        PipelinedShuffleReader(super::PipelinedShuffleReaderExecNode),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PipelinedShuffleReaderExecNode {
+    #[prost(message, optional, tag = "1")]
+    pub handle: ::core::option::Option<ShuffleInputHandle>,
+    #[prost(uint32, repeated, tag = "2")]
+    pub upstream_partition_ids: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, optional, tag = "3")]
+    pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
+    #[prost(message, optional, tag = "4")]
+    pub partitioning: ::core::option::Option<::datafusion_proto::protobuf::Partitioning>,
 }
 /// Value-range router over N locally-sorted overlapping input partitions.
 /// Redistributes them into K range-disjoint output partitions where each
@@ -1127,7 +1140,7 @@ pub struct FailedTask {
     /// Whether this task failure should be counted to the maximum number of times the task is allowed to retry
     #[prost(bool, tag = "3")]
     pub count_to_failures: bool,
-    #[prost(oneof = "failed_task::FailedReason", tags = "4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "failed_task::FailedReason", tags = "4, 5, 6, 7, 8, 9, 10, 11")]
     pub failed_reason: ::core::option::Option<failed_task::FailedReason>,
 }
 /// Nested message and enum types in `FailedTask`.
@@ -1147,7 +1160,25 @@ pub mod failed_task {
         ResultLost(super::ResultLost),
         #[prost(message, tag = "9")]
         TaskKilled(super::TaskKilled),
+        #[prost(message, tag = "10")]
+        ShuffleInputInvalidated(super::ShuffleInputInvalidated),
+        #[prost(message, tag = "11")]
+        TailAdmissionRevoked(super::TailAdmissionRevoked),
     }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShuffleInputInvalidated {
+    #[prost(uint32, tag = "1")]
+    pub stage_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub expected_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub current_generation: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TailAdmissionRevoked {
+    #[prost(uint32, tag = "1")]
+    pub stage_id: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SuccessfulTask {
@@ -1781,6 +1812,78 @@ pub struct RunningTaskInfo {
     #[prost(uint32, tag = "3")]
     pub stage_id: u32,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShuffleInputHandle {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub stage_id: u32,
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VersionedPartitionLocation {
+    #[prost(uint64, tag = "1")]
+    pub published_version: u64,
+    #[prost(message, optional, tag = "2")]
+    pub location: ::core::option::Option<PartitionLocation>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShuffleInputUpdate {
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    #[prost(uint64, tag = "2")]
+    pub version: u64,
+    #[prost(enumeration = "ShuffleInputLifecycle", tag = "3")]
+    pub lifecycle: i32,
+    #[prost(message, repeated, tag = "4")]
+    pub locations: ::prost::alloc::vec::Vec<VersionedPartitionLocation>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShuffleGenerationInvalidated {
+    #[prost(uint64, tag = "1")]
+    pub expected_generation: u64,
+    #[prost(uint64, tag = "2")]
+    pub current_generation: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenShuffleInputParams {
+    #[prost(message, optional, tag = "1")]
+    pub handle: ::core::option::Option<ShuffleInputHandle>,
+    /// Selection is set-like: duplicate ids do not duplicate returned locations.
+    #[prost(uint32, repeated, tag = "2")]
+    pub output_partition_ids: ::prost::alloc::vec::Vec<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PollShuffleInputParams {
+    #[prost(message, optional, tag = "1")]
+    pub handle: ::core::option::Option<ShuffleInputHandle>,
+    #[prost(uint64, tag = "2")]
+    pub after_version: u64,
+    /// Selection is set-like: duplicate ids do not duplicate returned locations.
+    #[prost(uint32, repeated, tag = "3")]
+    pub output_partition_ids: ::prost::alloc::vec::Vec<u32>,
+    /// The scheduler clamps this value to 30 seconds.
+    #[prost(uint32, tag = "4")]
+    pub max_wait_ms: u32,
+}
+/// Job/input closure is reported as NOT_FOUND. This result only describes an
+/// active handle: either its current generation or an explicit rollover.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShuffleInputResult {
+    #[prost(oneof = "shuffle_input_result::Result", tags = "1, 2")]
+    pub result: ::core::option::Option<shuffle_input_result::Result>,
+}
+/// Nested message and enum types in `ShuffleInputResult`.
+pub mod shuffle_input_result {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Update(super::ShuffleInputUpdate),
+        #[prost(message, tag = "2")]
+        Invalidated(super::ShuffleGenerationInvalidated),
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum BufferMode {
@@ -1905,6 +2008,32 @@ impl ShuffleFileKind {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ShuffleInputLifecycle {
+    ShuffleInputProducing = 0,
+    ShuffleInputSealed = 1,
+}
+impl ShuffleInputLifecycle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ShuffleInputProducing => "SHUFFLE_INPUT_PRODUCING",
+            Self::ShuffleInputSealed => "SHUFFLE_INPUT_SEALED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SHUFFLE_INPUT_PRODUCING" => Some(Self::ShuffleInputProducing),
+            "SHUFFLE_INPUT_SEALED" => Some(Self::ShuffleInputSealed),
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 pub mod scheduler_grpc_client {
     #![allow(
@@ -1995,6 +2124,64 @@ pub mod scheduler_grpc_client {
         pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
+        }
+        pub async fn open_shuffle_input(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenShuffleInputParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::ShuffleInputResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/OpenShuffleInput",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ballista.protobuf.SchedulerGrpc",
+                        "OpenShuffleInput",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn poll_shuffle_input(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PollShuffleInputParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::ShuffleInputResult>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ballista.protobuf.SchedulerGrpc/PollShuffleInput",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ballista.protobuf.SchedulerGrpc",
+                        "PollShuffleInput",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
         }
         /// Executors must poll the scheduler for heartbeat and to receive tasks
         pub async fn poll_work(
@@ -2361,6 +2548,20 @@ pub mod scheduler_grpc_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SchedulerGrpcServer.
     #[async_trait]
     pub trait SchedulerGrpc: std::marker::Send + std::marker::Sync + 'static {
+        async fn open_shuffle_input(
+            &self,
+            request: tonic::Request<super::OpenShuffleInputParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::ShuffleInputResult>,
+            tonic::Status,
+        >;
+        async fn poll_shuffle_input(
+            &self,
+            request: tonic::Request<super::PollShuffleInputParams>,
+        ) -> std::result::Result<
+            tonic::Response<super::ShuffleInputResult>,
+            tonic::Status,
+        >;
         /// Executors must poll the scheduler for heartbeat and to receive tasks
         async fn poll_work(
             &self,
@@ -2530,6 +2731,98 @@ pub mod scheduler_grpc_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/ballista.protobuf.SchedulerGrpc/OpenShuffleInput" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenShuffleInputSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::OpenShuffleInputParams>
+                    for OpenShuffleInputSvc<T> {
+                        type Response = super::ShuffleInputResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenShuffleInputParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::open_shuffle_input(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenShuffleInputSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ballista.protobuf.SchedulerGrpc/PollShuffleInput" => {
+                    #[allow(non_camel_case_types)]
+                    struct PollShuffleInputSvc<T: SchedulerGrpc>(pub Arc<T>);
+                    impl<
+                        T: SchedulerGrpc,
+                    > tonic::server::UnaryService<super::PollShuffleInputParams>
+                    for PollShuffleInputSvc<T> {
+                        type Response = super::ShuffleInputResult;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PollShuffleInputParams>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SchedulerGrpc>::poll_shuffle_input(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PollShuffleInputSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/ballista.protobuf.SchedulerGrpc/PollWork" => {
                     #[allow(non_camel_case_types)]
                     struct PollWorkSvc<T: SchedulerGrpc>(pub Arc<T>);

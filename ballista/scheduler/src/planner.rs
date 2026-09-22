@@ -790,14 +790,8 @@ pub fn remove_unresolved_shuffles(
     Ok(replace_children_if_necessary(stage, new_children)?)
 }
 
-/// Rollback the ShuffleReaderExec to UnresolvedShuffleExec.
-/// Used when the input stages are finished but some partitions are missing due to executor lost.
-/// The entire stage need to be rolled back and rescheduled.
-///
-/// `RangeShuffleReaderExec` rolls back to a plain `UnresolvedShuffleExec` — its
-/// range-ness is a derived property of the child's declared ordering at plan
-/// time, not intrinsic reader metadata. Re-planning walks the adapter, which
-/// re-detects the ordering and plants a fresh `RangeShuffleReaderExec`.
+/// Resolve eligible static shuffle edges against pinned producer histories.
+/// This path deliberately skips optimizations that require final statistics.
 pub fn resolve_pipelined_shuffles(
     plan: Arc<dyn ExecutionPlan>,
     handles: &std::collections::HashMap<
@@ -839,6 +833,9 @@ pub fn resolve_pipelined_shuffles(
     Ok(replace_children_if_necessary(plan, children)?)
 }
 
+/// Roll readers back to unresolved edges after their input history is lost.
+/// Range-reader ordering is reconstructed by the normal planning path, while
+/// pipelined readers retain the full, unsliced producer partitioning.
 pub fn rollback_resolved_shuffles(
     stage: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {

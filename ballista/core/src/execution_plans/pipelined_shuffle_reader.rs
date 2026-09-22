@@ -252,6 +252,128 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug)]
+    struct TransportSource {
+        responses:
+            Mutex<VecDeque<std::result::Result<pb::ShuffleInputResult, tonic::Status>>>,
+        cursors: Mutex<Vec<Option<u64>>>,
+    }
+
+    #[async_trait]
+    impl ShuffleInputClient for TransportSource {
+        async fn update(
+            &self,
+            _: pb::ShuffleInputHandle,
+            _: u32,
+            after: Option<u64>,
+        ) -> std::result::Result<pb::ShuffleInputResult, tonic::Status> {
+            self.cursors.lock().unwrap().push(after);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected metadata retry")
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_metadata_failures_retry_without_advancing_cursor() -> Result<()> {
+        let source = Arc::new(TransportSource {
+            responses: Mutex::new(VecDeque::from([
+                Err(tonic::Status::unavailable("temporary outage")),
+                Ok(metadata_update(1, 0, vec![])),
+                Err(tonic::Status::deadline_exceeded("temporary timeout")),
+                Ok(metadata_update(2, 1, vec![])),
+            ])),
+            cursors: Mutex::new(vec![]),
+        });
+        let directory = tempfile::tempdir()?;
+        let mut stream =
+            execute_script(source.clone(), &directory, Arc::new(Schema::empty()))?;
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            *source.cursors.lock().unwrap(),
+            vec![None, None, Some(1), Some(1)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_metadata_retries_remain_retryable_task_failures() -> Result<()> {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::PermissionDenied,
+        ] {
+            let transient = code != tonic::Code::PermissionDenied;
+            let attempts = if transient { 4 } else { 1 };
+            let source = Arc::new(TransportSource {
+                responses: Mutex::new(
+                    (0..attempts)
+                        .map(|_| Err(tonic::Status::new(code, "injected failure")))
+                        .collect(),
+                ),
+                cursors: Mutex::new(vec![]),
+            });
+            let directory = tempfile::tempdir()?;
+            let mut stream =
+                execute_script(source.clone(), &directory, Arc::new(Schema::empty()))?;
+            let error = stream.next().await.unwrap().unwrap_err();
+            let failure = pb::FailedTask::from(BallistaError::from(error));
+            assert_eq!(failure.retryable, transient);
+            assert_eq!(failure.count_to_failures, transient);
+            assert_eq!(source.cursors.lock().unwrap().len(), attempts);
+        }
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct WaitingSource {
+        entered: tokio::sync::Notify,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ShuffleInputClient for WaitingSource {
+        async fn update(
+            &self,
+            _: pb::ShuffleInputHandle,
+            _: u32,
+            _: Option<u64>,
+        ) -> std::result::Result<pb::ShuffleInputResult, tonic::Status> {
+            struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = DropFlag(self.dropped.clone());
+            self.entered.notify_one();
+            futures::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_reader_cancels_in_flight_metadata_request() -> Result<()> {
+        let source = Arc::new(WaitingSource {
+            entered: tokio::sync::Notify::new(),
+            dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let directory = tempfile::tempdir()?;
+        let mut stream =
+            execute_script(source.clone(), &directory, Arc::new(Schema::empty()))?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = source.entered.notified() => {}
+                _ = stream.next() => panic!("pending metadata cannot produce a batch or EOF"),
+            }
+        }).await.expect("reader must start its metadata request");
+        assert!(!source.dropped.load(Ordering::SeqCst));
+        drop(stream);
+        assert!(source.dropped.load(Ordering::SeqCst));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn partition_local_cursor_advances_across_empty_global_update() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -370,6 +492,26 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(values.value(0), 11);
         assert!(stream.next().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_artifact_cannot_change_its_publication_version() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let schema = test_schema();
+        let location = materialized_location(&directory, 0, 0, 11, &schema)?;
+        let source = ScriptedSource::new(vec![
+            metadata_update(1, 0, vec![(1, location.clone())]),
+            metadata_update(2, 1, vec![(2, location)]),
+        ]);
+        let mut stream = execute_script(source, &directory, schema)?;
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting shuffle location replay")
+        );
         Ok(())
     }
 
@@ -883,6 +1025,17 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                 }
                                 .into_datafusion());
                             }
+                            Err(status) if matches!(status.code(),
+                                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
+                                // Exhausting the short metadata retry loop is
+                                // a retryable task I/O failure, not a permanent
+                                // query execution error. The scheduler's normal
+                                // retry budget bounds prolonged outages.
+                                return Err(BallistaError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    format!("shuffle metadata transport retries exhausted: {status}"),
+                                )).into_datafusion());
+                            }
                             Err(status) => {
                                 return Err(BallistaError::from(status).into_datafusion());
                             }
@@ -940,8 +1093,6 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                     for block in update.locations {
                         if block.published_version == 0
                             || block.published_version > update.version
-                            || after
-                                .is_some_and(|cursor| block.published_version <= cursor)
                         {
                             return Err(DataFusionError::Execution(
                                 "invalid shuffle publication version".into(),
@@ -972,11 +1123,20 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                         );
                         match seen.get(&key) {
                             None => {
-                                seen.insert(key, location.clone());
+                                // Only an already-seen, identical publication
+                                // may be replayed behind the cursor. An unseen
+                                // old publication would mean data was skipped.
+                                if after.is_some_and(|cursor| block.published_version <= cursor) {
+                                    return Err(DataFusionError::Execution(
+                                        "invalid shuffle publication version".into(),
+                                    ));
+                                }
+                                seen.insert(key, (block.published_version, location.clone()));
                                 locations.push(location);
                                 discovered.add(1);
                             }
-                            Some(previous) if previous == &location => {
+                            Some((version, previous))
+                                if *version == block.published_version && previous == &location => {
                                 duplicates.add(1);
                             }
                             Some(_) => {
