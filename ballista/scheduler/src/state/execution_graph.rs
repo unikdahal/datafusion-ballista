@@ -33,6 +33,7 @@ use ballista_core::execution_plans::{
     RangeShuffleWriterExec, ShuffleWriter, ShuffleWriterExec, SortShuffleWriterExec,
     UnresolvedShuffleExec,
 };
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::failed_task::FailedReason;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{FailedJob, ShuffleWritePartition, job_status};
@@ -340,7 +341,81 @@ pub struct RunningTaskInfo {
     pub executor_id: String,
 }
 
+/// Single source of truth for shuffle shapes that are safe for static
+/// pipelining. Keeping the matrix explicit prevents later planner additions
+/// from accidentally widening admission.
+fn pipelined_shape_eligible(
+    broadcast: bool,
+    coalesced: bool,
+    range_reader: bool,
+    range_writer: bool,
+) -> bool {
+    !broadcast && !coalesced && !range_reader && !range_writer
+}
+
+fn pipelined_plan_eligible(plan: &dyn ExecutionPlan) -> bool {
+    if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+        return pipelined_shape_eligible(
+            reader.broadcast,
+            reader.coalesce.is_some(),
+            matches!(
+                reader.properties().partitioning,
+                datafusion::physical_plan::Partitioning::Range(_)
+            ),
+            false,
+        );
+    }
+    if plan.is::<RangeShuffleWriterExec>() {
+        return pipelined_shape_eligible(false, false, false, true);
+    }
+    plan.children()
+        .iter()
+        .all(|child| pipelined_plan_eligible(child.as_ref()))
+}
+
 impl StaticExecutionGraph {
+    fn pipelining_enabled(&self) -> bool {
+        self.session_config.ballista_shuffle_pipelined_enabled()
+            && !self
+                .session_config
+                .ballista_adaptive_query_planner_enabled()
+    }
+
+    /// Eligibility is structural. Admission separately checks producer pending work.
+    fn pipelined_handles(
+        &self,
+        stage: &UnresolvedStage,
+    ) -> Option<HashMap<usize, ballista_core::serde::protobuf::ShuffleInputHandle>> {
+        if !self.pipelining_enabled()
+            || stage.output_links.is_empty()
+            || stage.inputs.is_empty()
+        {
+            return None;
+        }
+        if !pipelined_plan_eligible(stage.plan.as_ref()) {
+            return None;
+        }
+        let registry = self.shuffle_inputs.lock();
+        stage
+            .inputs
+            .keys()
+            .map(|producer| {
+                let producer_plan = self.stages.get(producer)?.plan();
+                if producer_plan.is::<RangeShuffleWriterExec>() {
+                    return None;
+                }
+                let state = registry.get(&self.job_id, *producer)?;
+                Some((
+                    *producer,
+                    ballista_core::serde::protobuf::ShuffleInputHandle {
+                        job_id: self.job_id.to_string(),
+                        stage_id: *producer as u32,
+                        generation: state.generation(),
+                    },
+                ))
+            })
+            .collect()
+    }
     /// Creates a new `ExecutionGraph` from a physical execution plan.
     ///
     /// This will use the `DistributedPlanner` to break the plan into stages
@@ -363,10 +438,27 @@ impl StaticExecutionGraph {
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
 
+        let pipelining_requested = session_config.ballista_shuffle_pipelined_enabled();
+        let adaptive_enabled = session_config.ballista_adaptive_query_planner_enabled();
+        if pipelining_requested && adaptive_enabled {
+            warn!(
+                "ballista.shuffle.pipelined.enabled=true is ignored because \
+                 ballista.planner.adaptive.enabled=true; disable adaptive planning \
+                 to enable experimental static pipelined shuffle"
+            );
+        }
+
+        let mut shuffle_inputs = super::shuffle_input::ShuffleInputRegistry::default();
+        if pipelining_requested && !adaptive_enabled {
+            for stage_id in stages.keys() {
+                shuffle_inputs.create(job_id, *stage_id);
+            }
+        }
+
         let started_at = timestamp_millis();
 
         Ok(Self {
-            shuffle_inputs: Arc::new(parking_lot::Mutex::new(Default::default())),
+            shuffle_inputs: Arc::new(parking_lot::Mutex::new(shuffle_inputs)),
             scheduler_id: Some(scheduler_id.to_string()),
             job_id: job_id.to_owned(),
             job_name: job_name.to_owned(),
@@ -773,6 +865,7 @@ impl ExecutionGraph for StaticExecutionGraph {
         max_stage_failures: usize,
     ) -> Result<Vec<QueryStageSchedulerEvent>> {
         let job_id = self.job_id().to_owned();
+        let pipelining_enabled = self.pipelining_enabled();
         // First of all, classify the statuses by stages
         let mut job_task_statuses: HashMap<usize, Vec<TaskStatus>> = HashMap::new();
         for task_status in task_statuses {
@@ -810,9 +903,16 @@ impl ExecutionGraph for StaticExecutionGraph {
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
-                        if task_stage_attempt_num < running_stage.stage_attempt_num {
+                        let invalid_stage_attempt = if pipelining_enabled {
+                            task_stage_attempt_num != running_stage.stage_attempt_num
+                        } else {
+                            // Preserve the pre-feature scheduler contract:
+                            // only older attempts are stale in legacy mode.
+                            task_stage_attempt_num < running_stage.stage_attempt_num
+                        };
+                        if invalid_stage_attempt {
                             warn!(
-                                "Ignore TaskStatus update with TID {} as it's from Stage {}.{} and there is a more recent stage attempt {}.{} running",
+                                "Ignore TaskStatus update with TID {} from Stage {}.{} while current attempt is {}.{}",
                                 task_status.task_id,
                                 stage_id,
                                 task_stage_attempt_num,
@@ -826,7 +926,15 @@ impl ExecutionGraph for StaticExecutionGraph {
                             "TID {}/{}.{}/{}",
                             job_id, stage_id, task_stage_attempt_num, task_id
                         );
-                        if !running_stage.update_task_info(task_id, task_status.clone()) {
+                        let task_status_for_update = task_status.clone();
+                        let is_success = matches!(
+                            task_status.status.as_ref(),
+                            Some(task_status::Status::Successful(_))
+                        );
+                        if !is_success
+                            && !running_stage
+                                .update_task_info(task_id, task_status_for_update.clone())
+                        {
                             continue;
                         }
 
@@ -964,24 +1072,81 @@ impl ExecutionGraph for StaticExecutionGraph {
                             successful_task,
                         )) = status
                         {
-                            // update task metrics for successful task
-                            running_stage
-                                .update_task_metrics(task_id, operator_metrics)?;
-
                             let SuccessfulTask {
                                 partitions,
                                 runtime_stats,
                                 window_state,
                                 ..
                             } = successful_task;
-                            running_stage
-                                .append_runtime_stats_reports(task_id, runtime_stats);
-                            running_stage
-                                .append_window_state_reports(task_id, window_state);
-
-                            locations.append(&mut partition_to_location(
+                            let mut committed = partition_to_location(
                                 &job_id, task_id, stage_id, executor, partitions,
-                            ));
+                            );
+
+                            if pipelining_enabled {
+                                // Validate graph-local fallible work before
+                                // taking the metadata lock. The current
+                                // generation is intentionally selected only
+                                // after locking so a still-valid in-flight
+                                // task can join a generation that rolled over
+                                // while it was executing.
+                                if !running_stage.can_publish_task_success(
+                                    task_id,
+                                    &task_status_for_update,
+                                ) {
+                                    continue;
+                                }
+                                let prepared_metrics = running_stage
+                                    .prepare_task_metrics(task_id, operator_metrics)?;
+
+                                let mut registry = self.shuffle_inputs.lock();
+                                let generation = registry
+                                    .get(&job_id, stage_id)
+                                    .map(|state| state.generation())
+                                    .ok_or_else(|| {
+                                        BallistaError::Internal(format!(
+                                            "pipelined shuffle input missing for job {job_id}, stage {stage_id}"
+                                        ))
+                                    })?;
+                                let prepared_commit = registry.prepare_commit(
+                                    &job_id,
+                                    stage_id,
+                                    generation,
+                                    task_id,
+                                    committed.clone(),
+                                )?;
+
+                                // Keep the registry lock across the infallible
+                                // graph transition and prepared metadata
+                                // commit, so generation/version cannot change
+                                // between validation and visibility.
+                                running_stage
+                                    .apply_task_info(task_id, task_status_for_update);
+                                running_stage
+                                    .apply_prepared_task_metrics(prepared_metrics);
+                                running_stage
+                                    .append_runtime_stats_reports(task_id, runtime_stats);
+                                running_stage
+                                    .append_window_state_reports(task_id, window_state);
+                                registry.commit_prepared(prepared_commit);
+                            } else {
+                                // Feature off (or deliberately ineffective,
+                                // e.g. AQE still enabled): preserve the
+                                // pre-pipelining status/metrics/report ordering
+                                // and behavior without touching the new
+                                // registry mutex.
+                                if !running_stage
+                                    .update_task_info(task_id, task_status_for_update)
+                                {
+                                    continue;
+                                }
+                                running_stage
+                                    .update_task_metrics(task_id, operator_metrics)?;
+                                running_stage
+                                    .append_runtime_stats_reports(task_id, runtime_stats);
+                                running_stage
+                                    .append_window_state_reports(task_id, window_state);
+                            }
+                            locations.append(&mut committed);
                         } else {
                             warn!(
                                 "The task {task_identity}'s status is invalid for updating"
@@ -992,6 +1157,18 @@ impl ExecutionGraph for StaticExecutionGraph {
                     let is_final_successful = running_stage.is_successful()
                         && !reset_running_stages.contains_key(&stage_id);
                     if is_final_successful {
+                        if pipelining_enabled {
+                            let mut registry = self.shuffle_inputs.lock();
+                            let generation = registry
+                                .get(&job_id, stage_id)
+                                .map(|s| s.generation())
+                                .ok_or_else(|| {
+                                    BallistaError::Internal(format!(
+                                        "pipelined shuffle input missing while sealing job {job_id}, stage {stage_id}"
+                                    ))
+                                })?;
+                            registry.seal(&job_id, stage_id, generation)?;
+                        }
                         successful_stages.insert(stage_id);
                         // if this stage is final successful, we want to combine the stage metrics to plan's metric set and print out the plan
                         if let Some(stage_metrics) = running_stage.stage_metrics.as_ref()
@@ -1840,7 +2017,10 @@ mod test {
     use std::sync::Arc;
 
     use crate::scheduler_server::event::QueryStageSchedulerEvent;
+    use ballista_core::JobId;
     use ballista_core::error::{BallistaError, Result};
+    use ballista_core::execution_plans::UnresolvedShuffleExec;
+    use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::protobuf::{
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status, task_status,
@@ -1850,9 +2030,10 @@ mod test {
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
     };
+    use datafusion::prelude::SessionConfig;
 
     use crate::state::execution_graph::ExecutionGraph;
     use crate::state::execution_stage::ExecutionStage;
@@ -1860,13 +2041,77 @@ mod test {
         mock_completed_task, mock_executor, mock_failed_task,
         revive_graph_and_complete_next_stage,
         revive_graph_and_complete_next_stage_with_executor, test_aggregation_plan,
-        test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
-        test_union_all_plan, test_union_plan,
+        test_aggregation_plan_with_config, test_coalesce_plan, test_join_plan,
+        test_two_aggregations_plan, test_union_all_plan, test_union_plan,
     };
 
     #[derive(Debug)]
     struct FailingPlanRewriteExec {
         input: Arc<dyn ExecutionPlan>,
+    }
+
+    #[derive(Debug)]
+    struct EligibilityChildrenExec {
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl EligibilityChildrenExec {
+        fn new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
+            assert!(!inputs.is_empty());
+            let properties = inputs[0].properties().clone();
+            Self { inputs, properties }
+        }
+    }
+
+    impl DisplayAs for EligibilityChildrenExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "EligibilityChildrenExec")
+        }
+    }
+
+    impl ExecutionPlan for EligibilityChildrenExec {
+        fn name(&self) -> &str {
+            "EligibilityChildrenExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.inputs.iter().collect()
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(children)))
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            Err(DataFusionError::Plan(
+                "EligibilityChildrenExec is test-only".to_string(),
+            ))
+        }
     }
 
     impl DisplayAs for FailingPlanRewriteExec {
@@ -2068,6 +2313,348 @@ mod test {
             _ => panic!("expected the original running stage"),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipelined_shuffle_shape_eligibility_matrix() {
+        let cases = [
+            ("static", false, false, false, false, true),
+            ("broadcast", true, false, false, false, false),
+            ("coalesced", false, true, false, false, false),
+            ("range-reader", false, false, true, false, false),
+            ("range-writer", false, false, false, true, false),
+        ];
+
+        for (name, broadcast, coalesced, range_reader, range_writer, expected) in cases {
+            assert_eq!(
+                super::pipelined_shape_eligible(
+                    broadcast,
+                    coalesced,
+                    range_reader,
+                    range_writer,
+                ),
+                expected,
+                "unexpected eligibility for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipelined_plan_rejects_mixed_multi_input_when_one_edge_is_ineligible() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let eligible: Arc<dyn ExecutionPlan> = Arc::new(UnresolvedShuffleExec::new(
+            1,
+            schema.clone(),
+            Partitioning::UnknownPartitioning(2),
+        ));
+        let broadcast: Arc<dyn ExecutionPlan> =
+            Arc::new(UnresolvedShuffleExec::new_broadcast(2, schema, 2));
+
+        let all_static =
+            EligibilityChildrenExec::new(vec![eligible.clone(), eligible.clone()]);
+        assert!(super::pipelined_plan_eligible(&all_static));
+
+        let mixed = EligibilityChildrenExec::new(vec![eligible, broadcast]);
+        assert!(!super::pipelined_plan_eligible(&mixed));
+    }
+
+    #[tokio::test]
+    async fn test_final_stage_remains_behind_completion_barrier() -> Result<()> {
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-final-barrier");
+        let graph = test_aggregation_plan_with_config(2, &job, config).await;
+
+        let final_stage = graph
+            .stages
+            .values()
+            .find_map(|stage| match stage {
+                ExecutionStage::UnResolved(stage)
+                    if stage.output_links.is_empty() && !stage.inputs.is_empty() =>
+                {
+                    Some(stage)
+                }
+                _ => None,
+            })
+            .expect("expected an unresolved final stage");
+
+        assert!(
+            graph.pipelined_handles(final_stage).is_none(),
+            "final stage must never be admitted before producer completion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_shuffle_publication_does_not_accept_task_success() -> Result<()>
+    {
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job_id = JobId::from("pipelined-rejected-publication");
+        let executor = mock_executor("executor-id1".to_string());
+        let mut graph = test_aggregation_plan_with_config(2, &job_id, config).await;
+        graph.revive();
+
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+        let task_id = task.key.task_id;
+
+        {
+            let mut registry = graph.shuffle_inputs.lock();
+            let generation = registry
+                .get(&job_id, stage_id)
+                .expect("registry state")
+                .generation();
+            registry.seal(&job_id, stage_id, generation)?;
+        }
+
+        let task_status = mock_completed_task(task, &executor.id);
+        assert!(
+            graph
+                .update_task_status(&executor, vec![task_status], 1, 1)
+                .is_err(),
+            "publication into a sealed generation must fail"
+        );
+
+        let ExecutionStage::Running(stage) = graph
+            .stages
+            .get(&stage_id)
+            .expect("stage should remain running")
+        else {
+            panic!("failed publication must not transition the stage");
+        };
+        assert!(matches!(
+            stage.task_infos[task_id].task_status,
+            task_status::Status::Running(_)
+        ));
+        assert!(
+            stage.stage_metrics.is_none(),
+            "metrics must not be applied before publication is accepted"
+        );
+        assert!(stage.runtime_stats_reports.is_empty());
+        assert!(stage.window_state_reports.is_empty());
+
+        let registry = graph.shuffle_inputs.lock();
+        let state = registry
+            .get(&job_id, stage_id)
+            .expect("registry state should remain present");
+        assert!(!state.has_committed_input());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_success_replay_does_not_publish_twice() -> Result<()> {
+        use crate::state::shuffle_input::ShuffleInputRead;
+
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-replay");
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
+        graph.revive();
+
+        let executor = mock_executor("executor-id1".to_string());
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+        let status = mock_completed_task(task, &executor.id);
+
+        graph.update_task_status(&executor, vec![status.clone()], 1, 1)?;
+        let (generation, first_version) = {
+            let registry = graph.shuffle_inputs.lock();
+            let state = registry.get(&job, stage_id).expect("registry state");
+            let generation = state.generation();
+            let ShuffleInputRead::Update(snapshot) =
+                registry.read(&job, stage_id, generation, 0, &[])?
+            else {
+                panic!("expected metadata update");
+            };
+            (generation, snapshot.version)
+        };
+
+        graph.update_task_status(&executor, vec![status], 1, 1)?;
+        let second_version = {
+            let registry = graph.shuffle_inputs.lock();
+            let ShuffleInputRead::Update(snapshot) =
+                registry.read(&job, stage_id, generation, 0, &[])?
+            else {
+                panic!("expected metadata update");
+            };
+            snapshot.version
+        };
+
+        assert_eq!(first_version, second_version);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mismatched_stage_attempt_success_cannot_publish() -> Result<()> {
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-stale-attempt");
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
+        graph.revive();
+
+        let executor = mock_executor("executor-id1".to_string());
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+        let task_id = task.key.task_id;
+        let mut status = mock_completed_task(task, &executor.id);
+
+        let ExecutionStage::Running(stage) =
+            graph.stages.get_mut(&stage_id).expect("running stage")
+        else {
+            panic!("expected running stage");
+        };
+        stage.stage_attempt_num += 1;
+        status.stage_attempt_num = (stage.stage_attempt_num - 1) as u32;
+
+        graph.update_task_status(&executor, vec![status.clone()], 1, 1)?;
+
+        // Active pipelining also rejects a future/mismatched attempt rather
+        // than accepting metadata that cannot belong to the current stage.
+        status.stage_attempt_num = (status.stage_attempt_num + 2) as u32;
+        graph.update_task_status(&executor, vec![status], 1, 1)?;
+
+        let ExecutionStage::Running(stage) =
+            graph.stages.get(&stage_id).expect("running stage")
+        else {
+            panic!("stale status must not transition the stage");
+        };
+        assert!(matches!(
+            stage.task_infos[task_id].task_status,
+            task_status::Status::Running(_)
+        ));
+        let registry = graph.shuffle_inputs.lock();
+        assert!(
+            !registry
+                .get(&job, stage_id)
+                .expect("registry state")
+                .has_committed_input()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_valid_inflight_task_publishes_into_current_generation_after_rollover()
+    -> Result<()> {
+        use crate::state::shuffle_input::ShuffleInputRead;
+
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-rollover-survivor");
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
+        graph.revive();
+
+        let executor = mock_executor("executor-id1".to_string());
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+
+        let generation = {
+            let mut registry = graph.shuffle_inputs.lock();
+            let old = registry
+                .get(&job, stage_id)
+                .expect("registry state")
+                .generation();
+            registry.invalidate(&job, stage_id, old, &HashSet::new())?
+        };
+
+        let status = mock_completed_task(task, &executor.id);
+        graph.update_task_status(&executor, vec![status], 1, 1)?;
+
+        let registry = graph.shuffle_inputs.lock();
+        let ShuffleInputRead::Update(snapshot) =
+            registry.read(&job, stage_id, generation, 0, &[0, 1])?
+        else {
+            panic!("surviving task must publish into the current generation");
+        };
+        assert_eq!(snapshot.generation, generation);
+        assert!(!snapshot.locations.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_active_pipelining_fails_closed_if_registry_state_is_missing()
+    -> Result<()> {
+        let config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .with_ballista_adaptive_query_planner(false),
+        );
+        let job = JobId::from("pipelined-missing-registry");
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
+        graph.revive();
+
+        let executor = mock_executor("executor-id1".to_string());
+        let task = graph
+            .pop_next_task(&executor.id)?
+            .expect("expected a running producer task");
+        let stage_id = task.key.stage_id;
+        let task_id = task.key.task_id;
+
+        graph.shuffle_inputs.lock().close_job(&job);
+
+        let task_status = mock_completed_task(task, &executor.id);
+        let error = graph
+            .update_task_status(&executor, vec![task_status], 1, 1)
+            .expect_err("missing active registry state must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("pipelined shuffle input missing")
+        );
+
+        let ExecutionStage::Running(stage) = graph
+            .stages
+            .get(&stage_id)
+            .expect("stage should remain running")
+        else {
+            panic!("missing publication state must not transition the stage");
+        };
+        assert!(matches!(
+            stage.task_infos[task_id].task_status,
+            task_status::Status::Running(_)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipelining_disabled_does_not_initialize_shuffle_registry() -> Result<()>
+    {
+        let graph = test_aggregation_plan(2).await;
+        let registry = graph.shuffle_inputs.lock();
+        for stage_id in graph.stages.keys() {
+            assert!(
+                registry.get(&graph.job_id, *stage_id).is_none(),
+                "feature-off graph must retain the legacy scheduler path"
+            );
+        }
         Ok(())
     }
 
