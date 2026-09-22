@@ -21,7 +21,7 @@
 //! and StageOutput. Later integration should derive those compatibility views
 //! from this state rather than maintain another independently mutable copy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -44,12 +44,18 @@ pub(crate) struct ShuffleArtifactKey {
 }
 
 impl ShuffleArtifactKey {
-    fn from_location(location: &PartitionLocation) -> Self {
+    /// Creates the canonical producer-ownership key for one artifact.
+    pub(crate) fn from_location(location: &PartitionLocation) -> Self {
         Self {
             producer_task_id: location.map_partition_id,
             output_partition_id: location.partition_id.partition_id,
             file_id: location.file_id,
         }
+    }
+
+    /// Returns the producer task that owns this artifact.
+    pub(crate) fn producer_task_id(self) -> usize {
+        self.producer_task_id
     }
 }
 
@@ -169,6 +175,35 @@ pub(crate) enum ShufflePublicationResult {
     Replay,
 }
 
+/// Description of one successful exchange-epoch rollover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShuffleEpochRollover {
+    /// Epoch that was retired.
+    pub(crate) previous_epoch: ShuffleExchangeEpoch,
+    /// Fresh epoch containing only surviving producer output.
+    pub(crate) current_epoch: ShuffleExchangeEpoch,
+    /// Bootstrap cursor exposing every retained artifact in the fresh epoch.
+    ///
+    /// This is None when no materialized artifacts survive. Accepted empty
+    /// publications may still survive without creating a reader-visible event.
+    pub(crate) bootstrap_cursor: Option<ShuffleExchangeCursor>,
+    /// Accepted producer tasks removed by this rollover, in deterministic order.
+    pub(crate) invalidated_tasks: Vec<usize>,
+    /// Number of accepted producer tasks retained in the fresh epoch.
+    pub(crate) retained_task_count: usize,
+    /// Number of materialized artifacts retained in the fresh epoch.
+    pub(crate) retained_artifact_count: usize,
+}
+
+/// Result of applying an output-loss signal to an exchange.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShuffleInvalidationResult {
+    /// No accepted producer output matched the specific loss signal.
+    Unchanged,
+    /// The old materialized generation was retired.
+    Rolled(ShuffleEpochRollover),
+}
+
 /// Atomic snapshot of one output partition through a global exchange cursor.
 ///
 /// A consumer may persist through_cursor only after consuming every artifact
@@ -230,6 +265,11 @@ pub(crate) enum ShuffleExchangeError {
     },
     /// Sort shuffle requires a file id to address its consolidated data file.
     MissingSortShuffleFileId { producer_task_id: usize },
+    /// A producer attempted to reuse a physical file identity retired by recovery.
+    RetiredFileReuse {
+        file: ShuffleFileKey,
+        producer_task_id: usize,
+    },
     /// One task publication claimed artifacts on more than one data endpoint.
     MixedExecutorPublication { producer_task_id: usize },
     /// A publication used a layout different from the exchange's established layout.
@@ -251,6 +291,8 @@ pub(crate) enum ShuffleExchangeError {
         after: ShuffleExchangeSequence,
         current: ShuffleExchangeSequence,
     },
+    /// The exchange epoch cannot advance without wrapping.
+    EpochExhausted,
     /// The event sequence cannot advance without wrapping.
     SequenceExhausted,
 }
@@ -291,6 +333,13 @@ impl Display for ShuffleExchangeError {
                 f,
                 "sort shuffle publication from producer task {producer_task_id} has no file id"
             ),
+            Self::RetiredFileReuse {
+                file,
+                producer_task_id,
+            } => write!(
+                f,
+                "shuffle file {file:?} was retired by recovery and cannot be reused by producer task {producer_task_id}"
+            ),
             Self::MixedExecutorPublication { producer_task_id } => write!(
                 f,
                 "shuffle publication from producer task {producer_task_id} spans multiple data endpoints"
@@ -319,6 +368,7 @@ impl Display for ShuffleExchangeError {
                 after.get(),
                 current.get()
             ),
+            Self::EpochExhausted => f.write_str("shuffle exchange epoch exhausted"),
             Self::SequenceExhausted => f.write_str("shuffle exchange sequence exhausted"),
         }
     }
@@ -334,8 +384,10 @@ type Result<T> = std::result::Result<T, ShuffleExchangeError>;
 /// atomic mutation boundary: either every artifact in the report becomes visible
 /// at one event sequence, or the exchange remains unchanged.
 ///
-/// This PR models only the first epoch. Epoch rollover is intentionally added by
-/// the recovery follow-up so invalidation semantics stay independently reviewable.
+/// Epoch rollover preserves usable output while fencing readers pinned to the
+/// retired generation. Physical file identities removed by recovery remain
+/// retired for the lifetime of this logical exchange because the current
+/// on-disk shuffle path does not encode the exchange epoch.
 #[derive(Debug)]
 pub(crate) struct ShuffleExchangeState {
     generation: ShuffleExchangeGeneration,
@@ -345,9 +397,11 @@ pub(crate) struct ShuffleExchangeState {
     lifecycle: ShuffleExchangeLifecycle,
     artifacts: HashMap<ShuffleArtifactKey, PublishedShuffleArtifact>,
     // Physical shuffle file -> owning producer task in the current epoch.
-    // Recovery must also fence retired file identities because the current
-    // on-disk path does not contain the exchange epoch.
     file_owners: HashMap<ShuffleFileKey, usize>,
+    // Physical file identities retired by any prior epoch. These stay fenced
+    // because stale readers can still address the old path and the path itself
+    // does not contain the exchange epoch.
+    retired_files: HashSet<ShuffleFileKey>,
     // Output partition -> append-ordered (generation-local sequence, artifact key).
     // The state owns the generation, so duplicating a full cursor per entry would
     // repeat the same job/stage identity for every artifact.
@@ -379,6 +433,7 @@ impl ShuffleExchangeState {
             lifecycle: ShuffleExchangeLifecycle::Open,
             artifacts: HashMap::new(),
             file_owners: HashMap::new(),
+            retired_files: HashSet::new(),
             partition_index: HashMap::new(),
             accepted_tasks: HashMap::new(),
         }
@@ -438,6 +493,15 @@ impl ShuffleExchangeState {
         self.accepted_tasks.contains_key(&producer_task_id)
     }
 
+    /// Returns whether a physical shuffle path is current or permanently retired.
+    ///
+    /// Scheduler integration must use this before dispatching a writer. Rejecting
+    /// a publication after the executor has already overwritten a retired path is
+    /// only a last-line consistency check and cannot protect stale in-flight reads.
+    pub(crate) fn is_file_reserved(&self, file: ShuffleFileKey) -> bool {
+        self.file_owners.contains_key(&file) || self.retired_files.contains(&file)
+    }
+
     /// Atomically accepts one complete producer-task publication.
     ///
     /// Exact replay is idempotent, including after the exchange is sealed.
@@ -488,6 +552,12 @@ impl ShuffleExchangeState {
 
             let file = ShuffleFileKey::from_location(location)
                 .expect("canonical publication must have a valid shuffle file identity");
+            if self.retired_files.contains(&file) {
+                return Err(ShuffleExchangeError::RetiredFileReuse {
+                    file,
+                    producer_task_id,
+                });
+            }
             match self.file_owners.get(&file) {
                 Some(existing_producer_task_id)
                     if *existing_producer_task_id != producer_task_id =>
@@ -540,6 +610,59 @@ impl ShuffleExchangeState {
         Ok(ShufflePublicationResult::Committed {
             event_cursor: Some(event_cursor),
         })
+    }
+
+    /// Invalidates accepted output for the specified producer tasks.
+    ///
+    /// Recovery is task-granular: losing one output from a task retires that
+    /// task's whole accepted publication. Unknown task ids are ignored so
+    /// duplicate or delayed loss signals cannot churn the epoch.
+    pub(crate) fn invalidate_tasks(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+        lost_tasks: &[usize],
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+
+        let invalidated: BTreeSet<_> = lost_tasks
+            .iter()
+            .copied()
+            .filter(|task| self.accepted_tasks.contains_key(task))
+            .collect();
+        self.roll_epoch(invalidated, false)
+    }
+
+    /// Invalidates the producer tasks owning the specified materialized artifacts.
+    ///
+    /// Artifact loss is promoted to task loss because Ballista retries producer
+    /// output at task granularity. Unknown artifact keys are harmless no-ops.
+    pub(crate) fn invalidate_artifacts(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+        lost_artifacts: &[ShuffleArtifactKey],
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+
+        let invalidated: BTreeSet<_> = lost_artifacts
+            .iter()
+            .filter(|key| self.artifacts.contains_key(key))
+            .map(|key| key.producer_task_id())
+            .collect();
+        self.roll_epoch(invalidated, false)
+    }
+
+    /// Retires the entire current producer generation.
+    ///
+    /// A full producer-attempt reset always rolls the epoch, even when no task
+    /// has published output yet. Subscribers may already hold a cursor for the
+    /// open empty generation and must not silently cross the attempt boundary.
+    pub(crate) fn invalidate_all(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+        let invalidated = self.accepted_tasks.keys().copied().collect();
+        self.roll_epoch(invalidated, true)
     }
 
     /// Seals the current epoch.
@@ -605,6 +728,112 @@ impl ShuffleExchangeState {
             lifecycle: self.lifecycle,
             artifacts,
         })
+    }
+
+    fn roll_epoch(
+        &mut self,
+        invalidated_tasks: BTreeSet<usize>,
+        force_rollover: bool,
+    ) -> Result<ShuffleInvalidationResult> {
+        if invalidated_tasks.is_empty() && !force_rollover {
+            return Ok(ShuffleInvalidationResult::Unchanged);
+        }
+
+        // Allocate the fresh generation before constructing any replacement
+        // state so exhaustion leaves the old generation completely untouched.
+        let previous_epoch = self.epoch();
+        let current_epoch = previous_epoch
+            .checked_next()
+            .ok_or(ShuffleExchangeError::EpochExhausted)?;
+        let current_generation =
+            ShuffleExchangeGeneration::new(self.id().clone(), current_epoch);
+
+        let mut newly_retired = HashSet::new();
+        let mut retained = Vec::with_capacity(self.artifacts.len());
+        for (key, artifact) in &self.artifacts {
+            let file = ShuffleFileKey::from_location(&artifact.location)
+                .expect("committed shuffle artifact must have a valid file identity");
+            if invalidated_tasks.contains(&key.producer_task_id) {
+                newly_retired.insert(file);
+            } else {
+                retained.push((*key, artifact.location.clone()));
+            }
+        }
+        retained.sort_by_key(|(key, _)| *key);
+
+        let bootstrap_sequence = if retained.is_empty() {
+            ShuffleExchangeSequence::INITIAL
+        } else {
+            ShuffleExchangeSequence::INITIAL
+                .checked_next()
+                .expect("initial shuffle sequence must advance")
+        };
+        let bootstrap_cursor = if retained.is_empty() {
+            None
+        } else {
+            Some(ShuffleExchangeCursor::new(
+                current_generation.clone(),
+                bootstrap_sequence,
+            ))
+        };
+
+        let mut artifacts = HashMap::with_capacity(retained.len());
+        let mut file_owners = HashMap::new();
+        let mut partition_index:
+            HashMap<usize, Vec<(ShuffleExchangeSequence, ShuffleArtifactKey)>> =
+            HashMap::new();
+
+        for (key, location) in retained {
+            let file = ShuffleFileKey::from_location(&location)
+                .expect("retained shuffle artifact must have a valid file identity");
+            match file_owners.insert(file, key.producer_task_id) {
+                Some(existing) if existing != key.producer_task_id => {
+                    panic!("retained shuffle file has conflicting producer owners")
+                }
+                _ => {}
+            }
+            artifacts.insert(
+                key,
+                PublishedShuffleArtifact {
+                    sequence: bootstrap_sequence,
+                    location,
+                },
+            );
+            partition_index
+                .entry(key.output_partition_id)
+                .or_default()
+                .push((bootstrap_sequence, key));
+        }
+        for entries in partition_index.values_mut() {
+            entries.sort_by_key(|(_, key)| *key);
+        }
+
+        let mut accepted_tasks = HashMap::with_capacity(self.accepted_tasks.len());
+        for (task, keys) in &self.accepted_tasks {
+            if !invalidated_tasks.contains(task) {
+                accepted_tasks.insert(*task, keys.clone());
+            }
+        }
+
+        let rollover = ShuffleEpochRollover {
+            previous_epoch,
+            current_epoch,
+            bootstrap_cursor,
+            invalidated_tasks: invalidated_tasks.iter().copied().collect(),
+            retained_task_count: accepted_tasks.len(),
+            retained_artifact_count: artifacts.len(),
+        };
+
+        self.generation = current_generation;
+        self.sequence = bootstrap_sequence;
+        self.lifecycle = ShuffleExchangeLifecycle::Open;
+        self.artifacts = artifacts;
+        self.file_owners = file_owners;
+        self.retired_files.extend(newly_retired);
+        self.partition_index = partition_index;
+        self.accepted_tasks = accepted_tasks;
+
+        Ok(ShuffleInvalidationResult::Rolled(rollover))
     }
 
     fn cursor_at(&self, sequence: ShuffleExchangeSequence) -> ShuffleExchangeCursor {
@@ -1318,6 +1547,269 @@ mod tests {
                 actual: ShuffleExchangeId::new(JobId::from("other-job"), 7),
             }
         );
+    }
+
+    #[test]
+    fn task_invalidation_rebases_survivors_and_retires_lost_files() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        let task_zero = vec![location(0, 0, Some(10)), location(0, 1, Some(10))];
+        let task_one = vec![location(1, 0, Some(20))];
+
+        state.publish(epoch_one, 0, task_zero.clone()).unwrap();
+        state.publish(epoch_one, 1, task_one.clone()).unwrap();
+
+        let result = state.invalidate_tasks(epoch_one, &[0]).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+        let epoch_two = rollover.current_epoch;
+
+        assert_eq!(rollover.previous_epoch, epoch_one);
+        assert_eq!(epoch_two.get(), 2);
+        assert_eq!(rollover.bootstrap_cursor, Some(cursor(epoch_two, 1)));
+        assert_eq!(rollover.invalidated_tasks, vec![0]);
+        assert_eq!(rollover.retained_task_count, 1);
+        assert_eq!(rollover.retained_artifact_count, 1);
+        assert_eq!(state.cursor(), cursor(epoch_two, 1));
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(!state.is_task_accepted(0));
+        assert!(state.is_task_accepted(1));
+        assert!(state.is_file_reserved(ShuffleFileKey::sort(10)));
+        assert!(state.is_file_reserved(ShuffleFileKey::sort(20)));
+
+        assert!(matches!(
+            state.artifacts_after(&cursor(epoch_one, 0), 0),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+
+        assert_eq!(
+            state.publish(epoch_two, 1, task_one).unwrap(),
+            ShufflePublicationResult::Replay
+        );
+
+        assert_eq!(
+            state
+                .publish(epoch_two, 2, vec![location(2, 2, Some(10))])
+                .unwrap_err(),
+            ShuffleExchangeError::RetiredFileReuse {
+                file: ShuffleFileKey::sort(10),
+                producer_task_id: 2,
+            }
+        );
+
+        assert_eq!(
+            state
+                .publish(epoch_two, 2, vec![location(2, 0, Some(30))])
+                .unwrap(),
+            ShufflePublicationResult::Committed {
+                event_cursor: Some(cursor(epoch_two, 2))
+            }
+        );
+
+        assert!(matches!(
+            state.publish(epoch_two, 3, vec![location(3, 1, Some(20))]),
+            Err(ShuffleExchangeError::ConflictingFileOwnership { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_loss_invalidates_whole_producer_task() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        let task_zero = vec![location(0, 0, Some(10)), location(0, 1, Some(10))];
+
+        state.publish(epoch_one, 0, task_zero.clone()).unwrap();
+        state
+            .publish(epoch_one, 1, vec![location(1, 0, Some(20))])
+            .unwrap();
+
+        let lost = ShuffleArtifactKey::from_location(&task_zero[0]);
+        let result = state.invalidate_artifacts(epoch_one, &[lost]).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+
+        assert_eq!(rollover.invalidated_tasks, vec![0]);
+        assert!(!state.is_task_accepted(0));
+        assert!(state.is_task_accepted(1));
+        assert!(state.retired_files.contains(&ShuffleFileKey::sort(10)));
+    }
+
+    #[test]
+    fn accepted_empty_survivor_is_retained_without_bootstrap_artifact() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.publish(epoch_one, 1, vec![]).unwrap();
+
+        let result = state.invalidate_tasks(epoch_one, &[0]).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+
+        assert_eq!(rollover.bootstrap_cursor, None);
+        assert_eq!(rollover.retained_task_count, 1);
+        assert_eq!(rollover.retained_artifact_count, 0);
+        assert_eq!(state.sequence(), ShuffleExchangeSequence::INITIAL);
+        assert!(state.is_task_accepted(1));
+        assert_eq!(
+            state.publish(state.epoch(), 1, vec![]).unwrap(),
+            ShufflePublicationResult::Replay
+        );
+    }
+
+    #[test]
+    fn invalidate_all_retires_materialized_files_and_empty_publications() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.publish(epoch_one, 1, vec![]).unwrap();
+        state
+            .publish(epoch_one, 2, vec![location(2, 1, Some(20))])
+            .unwrap();
+
+        let result = state.invalidate_all(epoch_one).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+
+        assert_eq!(rollover.invalidated_tasks, vec![0, 1, 2]);
+        assert_eq!(rollover.retained_task_count, 0);
+        assert_eq!(rollover.retained_artifact_count, 0);
+        assert_eq!(rollover.bootstrap_cursor, None);
+        assert_eq!(state.epoch().get(), 2);
+        assert_eq!(state.cursor(), cursor(state.epoch(), 0));
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(!state.has_committed_artifacts());
+        assert!(!state.is_task_accepted(0));
+        assert!(!state.is_task_accepted(1));
+        assert!(!state.is_task_accepted(2));
+        assert!(state.retired_files.contains(&ShuffleFileKey::sort(10)));
+        assert!(state.retired_files.contains(&ShuffleFileKey::sort(20)));
+    }
+
+    #[test]
+    fn invalidate_all_without_output_still_retires_generation() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        let result = state.invalidate_all(epoch_one).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected forced epoch rollover")
+        };
+
+        assert_eq!(rollover.previous_epoch, epoch_one);
+        assert_eq!(rollover.current_epoch, state.epoch());
+        assert!(state.epoch() > epoch_one);
+        assert!(rollover.invalidated_tasks.is_empty());
+        assert_eq!(rollover.retained_task_count, 0);
+        assert_eq!(rollover.retained_artifact_count, 0);
+        assert_eq!(rollover.bootstrap_cursor, None);
+        assert_eq!(state.sequence(), ShuffleExchangeSequence::INITIAL);
+        assert!(state.retired_files.is_empty());
+    }
+
+    #[test]
+    fn unknown_specific_loss_does_not_churn_epoch() {
+        let mut state = exchange();
+        let epoch = state.epoch();
+        state
+            .publish(epoch, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+
+        assert_eq!(
+            state.invalidate_tasks(epoch, &[99, 99]).unwrap(),
+            ShuffleInvalidationResult::Unchanged
+        );
+        let unknown = ShuffleArtifactKey {
+            producer_task_id: 0,
+            output_partition_id: 0,
+            file_id: Some(999),
+        };
+        assert_eq!(
+            state.invalidate_artifacts(epoch, &[unknown]).unwrap(),
+            ShuffleInvalidationResult::Unchanged
+        );
+        assert_eq!(state.epoch(), epoch);
+    }
+
+    #[test]
+    fn invalidation_reopens_sealed_exchange_and_fences_old_cursor() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.seal(epoch_one).unwrap();
+
+        state.invalidate_tasks(epoch_one, &[0]).unwrap();
+        let epoch_two = state.epoch();
+
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(epoch_two > epoch_one);
+        assert!(matches!(
+            state.artifacts_after(&cursor(epoch_one, 0), 0),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+        assert!(matches!(
+            state.invalidate_all(epoch_one),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+        assert_eq!(state.epoch(), epoch_two);
+    }
+
+    #[test]
+    fn retired_file_fence_survives_multiple_epoch_rollovers() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.invalidate_all(epoch_one).unwrap();
+
+        let epoch_two = state.epoch();
+        state
+            .publish(epoch_two, 1, vec![location(1, 0, Some(20))])
+            .unwrap();
+        state.invalidate_all(epoch_two).unwrap();
+
+        let epoch_three = state.epoch();
+        assert!(matches!(
+            state.publish(epoch_three, 2, vec![location(2, 0, Some(10))]),
+            Err(ShuffleExchangeError::RetiredFileReuse { .. })
+        ));
+        assert!(matches!(
+            state.publish(epoch_three, 3, vec![location(3, 0, Some(20))]),
+            Err(ShuffleExchangeError::RetiredFileReuse { .. })
+        ));
+    }
+
+    #[test]
+    fn epoch_exhaustion_leaves_previous_state_intact() {
+        let mut state = exchange();
+        let epoch = ShuffleExchangeEpoch::new(u64::MAX).unwrap();
+        state.generation = ShuffleExchangeGeneration::new(exchange_id(), epoch);
+        state.sequence = ShuffleExchangeSequence::INITIAL;
+        state
+            .publish(epoch, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        let before = state.cursor();
+
+        assert_eq!(
+            state.invalidate_all(epoch).unwrap_err(),
+            ShuffleExchangeError::EpochExhausted
+        );
+        assert_eq!(state.cursor(), before);
+        assert!(state.is_task_accepted(0));
+        assert!(state.has_committed_artifacts());
+        assert!(state.retired_files.is_empty());
     }
 
     #[test]
