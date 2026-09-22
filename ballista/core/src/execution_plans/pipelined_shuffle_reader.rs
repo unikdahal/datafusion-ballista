@@ -39,7 +39,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use futures::TryStreamExt;
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use tonic::codegen::{Body, Bytes, StdError};
 
 use super::ShuffleReaderExec;
@@ -91,7 +92,6 @@ mod tests {
     use datafusion::arrow::ipc::writer::StreamWriter;
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionConfig;
-    use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -743,7 +743,10 @@ mod tests {
                             ..
                         }
                     ));
-                    assert_eq!(values, vec![0]);
+                    assert!(
+                        values.is_empty() || values == vec![0],
+                        "invalidation may preempt the active fetch, but data from a later generation must never appear: {values:?}"
+                    );
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -971,209 +974,349 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
             .subset_time("metadata_wait_time", partition);
         let invalidations = MetricBuilder::new(&self.metrics)
             .counter("generation_invalidations", partition);
-        // A stream of finite static fetch streams reuses the existing local/Flight
-        // engine, its concurrency limits, retries, and cancellation behavior.
-        // Metadata discovery intentionally follows a fetch-then-poll cadence:
-        // invalidation is observed between finite fetch streams, not concurrently
-        // while one static batch is being drained.
+        // Keep metadata discovery active while a finite static fetch stream is
+        // being drained. This lets generation invalidation or admission
+        // revocation interrupt a slow data read instead of waiting for the
+        // current batch of locations to finish. The metadata future lives in
+        // the returned stream state (no detached task), so dropping the reader
+        // still cancels an in-flight Open/PollShuffleInput request.
+        type MetadataFuture =
+            BoxFuture<'static, Result<pb::ShuffleInputResult>>;
+
+        let metadata_runtime = runtime.clone();
+        let metadata_handle = reader.handle.clone();
+        let metadata_poller: Arc<
+            dyn Fn(Option<u64>) -> MetadataFuture + Send + Sync,
+        > = Arc::new(move |after| {
+            let runtime = metadata_runtime.clone();
+            let handle = metadata_handle.clone();
+            let polls = polls.clone();
+            let wait = wait.clone();
+            async move {
+                let mut failures = 0;
+                loop {
+                    polls.add(1);
+                    let timer = wait.timer();
+                    let response =
+                        runtime.0.update(handle.clone(), upstream, after).await;
+                    drop(timer);
+                    match response {
+                        Ok(response) => return Ok(response),
+                        Err(status)
+                            if failures < 3
+                                && matches!(
+                                    status.code(),
+                                    tonic::Code::Unavailable
+                                        | tonic::Code::DeadlineExceeded
+                                ) =>
+                        {
+                            failures += 1;
+                            tokio::time::sleep(Duration::from_millis(
+                                100 * failures,
+                            ))
+                            .await;
+                        }
+                        // Open/PollShuffleInput reserves ABORTED for scheduler
+                        // admission revocation.
+                        Err(status) if status.code() == tonic::Code::Aborted => {
+                            return Err(BallistaError::TailAdmissionRevoked {
+                                stage_id: handle.stage_id as usize,
+                            }
+                            .into_datafusion());
+                        }
+                        Err(status)
+                            if matches!(
+                                status.code(),
+                                tonic::Code::Unavailable
+                                    | tonic::Code::DeadlineExceeded
+                            ) =>
+                        {
+                            return Err(BallistaError::IoError(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    format!(
+                                        "shuffle metadata transport retries exhausted: {status}"
+                                    ),
+                                ),
+                            )
+                            .into_datafusion());
+                        }
+                        Err(status) => {
+                            return Err(
+                                BallistaError::from(status).into_datafusion()
+                            );
+                        }
+                    }
+                }
+            }
+            .boxed()
+        });
+
+        struct ReaderState {
+            poll: Option<MetadataFuture>,
+            current: Option<SendableRecordBatchStream>,
+            pending: Vec<PartitionLocation>,
+            seen: HashMap<(usize, usize, Option<u64>), (u64, PartitionLocation)>,
+            after: Option<u64>,
+            sealed: bool,
+        }
+
+        let initial_poll = metadata_poller(None);
         let stream = futures::stream::try_unfold(
-            (None, HashMap::new(), false),
-            move |(after, mut seen, sealed)| {
+            ReaderState {
+                poll: Some(initial_poll),
+                current: None,
+                pending: vec![],
+                seen: HashMap::new(),
+                after: None,
+                sealed: false,
+            },
+            move |mut state| {
                 let reader = reader.clone();
-                let runtime = runtime.clone();
                 let context = context.clone();
                 let work_dir = work_dir.clone();
                 let discovered = discovered.clone();
                 let duplicates = duplicates.clone();
-                let polls = polls.clone();
                 let updates = updates.clone();
-                let wait = wait.clone();
                 let invalidations = invalidations.clone();
+                let metadata_poller = metadata_poller.clone();
                 async move {
-                    if sealed {
-                        return Ok(None);
-                    }
-                    let mut failures = 0;
-                    let response = loop {
-                        polls.add(1);
-                        let timer = wait.timer();
-                        let response = runtime
-                            .0
-                            .update(reader.handle.clone(), upstream, after)
-                            .await;
-                        drop(timer);
-                        match response {
-                            Ok(response) => break response,
-                            Err(status)
-                                if failures < 3
-                                    && matches!(
-                                        status.code(),
-                                        tonic::Code::Unavailable
-                                            | tonic::Code::DeadlineExceeded
-                                    ) =>
-                            {
-                                failures += 1;
-                                tokio::time::sleep(Duration::from_millis(100 * failures))
-                                    .await;
+                    loop {
+                        if state.current.is_none() && !state.pending.is_empty() {
+                            let locations = std::mem::take(&mut state.pending);
+                            let mut fetch = ShuffleReaderExec::try_new(
+                                reader.handle.stage_id as usize,
+                                vec![locations],
+                                reader.schema.clone(),
+                                Partitioning::UnknownPartitioning(1),
+                            )?
+                            .with_work_dir(work_dir.clone());
+                            if let Some(pool) = reader.client_pool.clone() {
+                                fetch = fetch.with_client_pool(pool);
                             }
-                            // Open/PollShuffleInput reserves ABORTED for
-                            // scheduler admission revocation. Do not reuse that
-                            // code for unrelated shuffle RPC failures.
-                            Err(status) if status.code() == tonic::Code::Aborted => {
-                                return Err(BallistaError::TailAdmissionRevoked {
-                                    stage_id: reader.handle.stage_id as usize,
-                                }
-                                .into_datafusion());
-                            }
-                            Err(status) if matches!(status.code(),
-                                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
-                                // Exhausting the short metadata retry loop is
-                                // a retryable task I/O failure, not a permanent
-                                // query execution error. The scheduler's normal
-                                // retry budget bounds prolonged outages.
-                                return Err(BallistaError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionReset,
-                                    format!("shuffle metadata transport retries exhausted: {status}"),
-                                )).into_datafusion());
-                            }
-                            Err(status) => {
-                                return Err(BallistaError::from(status).into_datafusion());
-                            }
+                            state.current = Some(fetch.execute(0, context.clone())?);
                         }
-                    };
-                    let update = match response.result {
-                        Some(pb::shuffle_input_result::Result::Update(update)) => update,
-                        Some(pb::shuffle_input_result::Result::Invalidated(
-                            invalidated,
-                        )) => {
-                            if invalidated.expected_generation != reader.handle.generation
-                                || invalidated.current_generation
-                                    <= invalidated.expected_generation
-                            {
+
+                        if state.sealed
+                            && state.current.is_none()
+                            && state.pending.is_empty()
+                        {
+                            return Ok(None);
+                        }
+
+                        if state.poll.is_none() && !state.sealed {
+                            state.poll = Some(metadata_poller(state.after));
+                        }
+
+                        enum Next {
+                            Metadata(Result<pb::ShuffleInputResult>),
+                            Batch(Option<Result<datafusion::arrow::record_batch::RecordBatch>>),
+                        }
+
+                        let next = match (
+                            state.poll.as_mut(),
+                            state.current.as_mut(),
+                        ) {
+                            (Some(poll), Some(fetch)) => {
+                                tokio::select! {
+                                    biased;
+                                    response = poll.as_mut() => Next::Metadata(response),
+                                    batch = fetch.next() => Next::Batch(batch),
+                                }
+                            }
+                            (Some(poll), None) => {
+                                Next::Metadata(poll.as_mut().await)
+                            }
+                            (None, Some(fetch)) => {
+                                Next::Batch(fetch.next().await)
+                            }
+                            (None, None) => {
                                 return Err(DataFusionError::Execution(
-                                    "invalid shuffle invalidation history".into(),
+                                    "pipelined shuffle reader made no progress"
+                                        .into(),
                                 ));
                             }
-                            invalidations.add(1);
-                            return Err(BallistaError::ShuffleGenerationInvalidated {
-                                stage_id: reader.handle.stage_id as usize,
-                                expected: reader.handle.generation,
-                                current: invalidated.current_generation,
+                        };
+
+                        match next {
+                            Next::Batch(Some(Ok(batch))) => {
+                                return Ok(Some((batch, state)));
                             }
-                            .into_datafusion());
-                        }
-                        None => {
-                            return Err(DataFusionError::Execution(
-                                "missing shuffle metadata result".into(),
-                            ));
-                        }
-                    };
-                    if update.generation != reader.handle.generation
-                        || update.version < after.unwrap_or(0)
-                        || !matches!(update.lifecycle, 0 | 1)
-                        || (update.lifecycle == 1 && update.version == after.unwrap_or(0))
-                    {
-                        return Err(DataFusionError::Execution(
-                            "invalid shuffle metadata history".into(),
-                        ));
-                    }
-                    updates.add(1);
-                    #[cfg(feature = "test-utils")]
-                    if update.lifecycle == 0 {
-                        producing_input_observations()
-                            .lock()
-                            .expect("producing-input observation mutex poisoned")
-                            .insert((
-                                reader.handle.job_id.clone(),
-                                reader.handle.stage_id,
-                                reader.handle.generation,
-                            ));
-                    }
-                    let mut locations = Vec::new();
-                    for block in update.locations {
-                        if block.published_version == 0
-                            || block.published_version > update.version
-                        {
-                            return Err(DataFusionError::Execution(
-                                "invalid shuffle publication version".into(),
-                            ));
-                        }
-                        let location: PartitionLocation = block
-                            .location
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "missing shuffle location".into(),
-                                )
-                            })?
-                            .try_into()
-                            .map_err(|e: BallistaError| e.into_datafusion())?;
-                        if location.partition_id.job_id.as_str() != reader.handle.job_id
-                            || location.partition_id.stage_id
-                                != reader.handle.stage_id as usize
-                            || location.partition_id.partition_id != upstream as usize
-                        {
-                            return Err(DataFusionError::Execution(
-                                "shuffle location identity mismatch".into(),
-                            ));
-                        }
-                        let key = (
-                            location.map_partition_id,
-                            location.partition_id.partition_id,
-                            location.file_id,
-                        );
-                        match seen.get(&key) {
-                            None => {
-                                // Only an already-seen, identical publication
-                                // may be replayed behind the cursor. An unseen
-                                // old publication would mean data was skipped.
-                                if after.is_some_and(|cursor| block.published_version <= cursor) {
+                            Next::Batch(Some(Err(error))) => return Err(error),
+                            Next::Batch(None) => {
+                                state.current = None;
+                                continue;
+                            }
+                            Next::Metadata(response) => {
+                                state.poll = None;
+                                let response = response?;
+                                let update = match response.result {
+                                    Some(
+                                        pb::shuffle_input_result::Result::Update(
+                                            update,
+                                        ),
+                                    ) => update,
+                                    Some(
+                                        pb::shuffle_input_result::Result::Invalidated(
+                                            invalidated,
+                                        ),
+                                    ) => {
+                                        if invalidated.expected_generation
+                                            != reader.handle.generation
+                                            || invalidated.current_generation
+                                                <= invalidated.expected_generation
+                                        {
+                                            return Err(
+                                                DataFusionError::Execution(
+                                                    "invalid shuffle invalidation history"
+                                                        .into(),
+                                                ),
+                                            );
+                                        }
+                                        invalidations.add(1);
+                                        return Err(
+                                            BallistaError::ShuffleGenerationInvalidated {
+                                                stage_id: reader.handle.stage_id
+                                                    as usize,
+                                                expected: reader.handle.generation,
+                                                current: invalidated
+                                                    .current_generation,
+                                            }
+                                            .into_datafusion(),
+                                        );
+                                    }
+                                    None => {
+                                        return Err(DataFusionError::Execution(
+                                            "missing shuffle metadata result"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+
+                                if update.generation
+                                    != reader.handle.generation
+                                    || update.version
+                                        < state.after.unwrap_or(0)
+                                    || !matches!(update.lifecycle, 0 | 1)
+                                    || (update.lifecycle == 1
+                                        && update.version
+                                            == state.after.unwrap_or(0))
+                                {
                                     return Err(DataFusionError::Execution(
-                                        "invalid shuffle publication version".into(),
+                                        "invalid shuffle metadata history".into(),
                                     ));
                                 }
-                                seen.insert(key, (block.published_version, location.clone()));
-                                locations.push(location);
-                                discovered.add(1);
-                            }
-                            Some((version, previous))
-                                if *version == block.published_version && previous == &location => {
-                                duplicates.add(1);
-                            }
-                            Some(_) => {
-                                return Err(DataFusionError::Execution(
-                                    "conflicting shuffle location replay".into(),
-                                ));
+                                updates.add(1);
+
+                                #[cfg(feature = "test-utils")]
+                                if update.lifecycle == 0 {
+                                    producing_input_observations()
+                                        .lock()
+                                        .expect(
+                                            "producing-input observation mutex poisoned",
+                                        )
+                                        .insert((
+                                            reader.handle.job_id.clone(),
+                                            reader.handle.stage_id,
+                                            reader.handle.generation,
+                                        ));
+                                }
+
+                                for block in update.locations {
+                                    if block.published_version == 0
+                                        || block.published_version > update.version
+                                    {
+                                        return Err(
+                                            DataFusionError::Execution(
+                                                "invalid shuffle publication version"
+                                                    .into(),
+                                            ),
+                                        );
+                                    }
+                                    let location: PartitionLocation = block
+                                        .location
+                                        .ok_or_else(|| {
+                                            DataFusionError::Execution(
+                                                "missing shuffle location".into(),
+                                            )
+                                        })?
+                                        .try_into()
+                                        .map_err(|e: BallistaError| {
+                                            e.into_datafusion()
+                                        })?;
+                                    if location.partition_id.job_id.as_str()
+                                        != reader.handle.job_id
+                                        || location.partition_id.stage_id
+                                            != reader.handle.stage_id as usize
+                                        || location
+                                            .partition_id
+                                            .partition_id
+                                            != upstream as usize
+                                    {
+                                        return Err(
+                                            DataFusionError::Execution(
+                                                "shuffle location identity mismatch"
+                                                    .into(),
+                                            ),
+                                        );
+                                    }
+                                    let key = (
+                                        location.map_partition_id,
+                                        location.partition_id.partition_id,
+                                        location.file_id,
+                                    );
+                                    match state.seen.get(&key) {
+                                        None => {
+                                            if state.after.is_some_and(
+                                                |cursor| {
+                                                    block.published_version
+                                                        <= cursor
+                                                },
+                                            ) {
+                                                return Err(
+                                                    DataFusionError::Execution(
+                                                        "invalid shuffle publication version"
+                                                            .into(),
+                                                    ),
+                                                );
+                                            }
+                                            state.seen.insert(
+                                                key,
+                                                (
+                                                    block.published_version,
+                                                    location.clone(),
+                                                ),
+                                            );
+                                            state.pending.push(location);
+                                            discovered.add(1);
+                                        }
+                                        Some((version, previous))
+                                            if *version
+                                                == block.published_version
+                                                && previous == &location =>
+                                        {
+                                            duplicates.add(1);
+                                        }
+                                        Some(_) => {
+                                            return Err(
+                                                DataFusionError::Execution(
+                                                    "conflicting shuffle location replay"
+                                                        .into(),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                state.after = Some(update.version);
+                                state.sealed = update.lifecycle == 1;
                             }
                         }
                     }
-                    let stream: SendableRecordBatchStream = if locations.is_empty() {
-                        Box::pin(RecordBatchStreamAdapter::new(
-                            reader.schema.clone(),
-                            futures::stream::empty::<
-                                Result<datafusion::arrow::record_batch::RecordBatch>,
-                            >(),
-                        ))
-                    } else {
-                        let mut fetch = ShuffleReaderExec::try_new(
-                            reader.handle.stage_id as usize,
-                            vec![locations],
-                            reader.schema.clone(),
-                            Partitioning::UnknownPartitioning(1),
-                        )?
-                        .with_work_dir(work_dir);
-                        if let Some(pool) = reader.client_pool {
-                            fetch = fetch.with_client_pool(pool);
-                        }
-                        fetch.execute(0, context)?
-                    };
-                    Ok(Some((
-                        stream,
-                        (Some(update.version), seen, update.lifecycle == 1),
-                    )))
                 }
             },
-        )
-        .try_flatten();
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
             stream,
