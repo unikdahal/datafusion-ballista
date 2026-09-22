@@ -67,12 +67,18 @@ pub enum BallistaError {
     FetchFailed(String, usize, usize, String),
     /// The task must be restarted against the current immutable input history.
     ShuffleGenerationInvalidated {
+        /// Producer whose committed output history changed.
         stage_id: usize,
+        /// Generation pinned by the failed consumer.
         expected: u64,
+        /// Replacement generation reported by the scheduler.
         current: u64,
     },
     /// A pipelined consumer must stop because producer work reopened.
-    TailAdmissionRevoked { stage_id: usize },
+    TailAdmissionRevoked {
+        /// Producer that must receive capacity before its consumers.
+        stage_id: usize,
+    },
     /// Operation was cancelled.
     Cancelled,
 }

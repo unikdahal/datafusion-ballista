@@ -53,6 +53,23 @@ use std::time::{Duration, Instant};
 static E2E_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+async fn setup_cluster() -> (String, u16) {
+    let address = ballista_scheduler::standalone::new_standalone_scheduler()
+        .await
+        .unwrap();
+    let host = "localhost".to_owned();
+    let scheduler =
+        SchedulerGrpcClient::connect(format!("http://{host}:{}", address.port()))
+            .await
+            .unwrap();
+    // Overlap requires a free slot beside the straggler, even on a single-core
+    // runner. Keep the same explicit capacity for baseline and pipelined jobs.
+    ballista_executor::new_standalone_executor(scheduler, 4, BallistaCodec::default())
+        .await
+        .unwrap();
+    (host, address.port())
+}
+
 fn straggler_plan(delay_ms: u64) -> Arc<dyn ExecutionPlan> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let mut inputs = vec![];
@@ -204,7 +221,7 @@ async fn collect_job(
 }
 
 async fn run(enabled: bool, remote: bool, delay_ms: u64) -> Duration {
-    let (host, port) = common::setup_test_cluster().await;
+    let (host, port) = setup_cluster().await;
     let config = SessionConfig::new_with_ballista()
         .with_ballista_adaptive_query_planner(false)
         .with_ballista_shuffle_pipelined_enabled(enabled)
@@ -275,7 +292,7 @@ async fn straggler_results_match_with_local_and_flight_fetches() {
 #[tokio::test]
 async fn executor_loss_invalidates_live_generation_and_recovers_exactly_once() {
     let _guard = E2E_LOCK.lock().await;
-    let (host, port) = common::setup_test_cluster().await;
+    let (host, port) = setup_cluster().await;
     let mut scheduler = SchedulerGrpcClient::connect(format!("http://{host}:{port}"))
         .await
         .unwrap();

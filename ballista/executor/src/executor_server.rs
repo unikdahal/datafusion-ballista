@@ -402,55 +402,52 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             contains_pipelined_reader(&task.plan)
         };
 
-        match self.get_scheduler_client(&scheduler_id).await {
-            Ok(client) => {
-                task.session_config = task.session_config.with_extension(Arc::new(
+        if requires_shuffle_metadata {
+            match self.get_scheduler_client(&scheduler_id).await {
+                Ok(client) => {
+                    task.session_config = task.session_config.with_extension(Arc::new(
                     ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime(
                         Arc::new(client),
                     ),
                 ));
-            }
-            Err(e) if requires_shuffle_metadata => {
-                // Without this client a pipelined reader cannot make progress. Report
-                // the setup failure explicitly as retryable connectivity instead of
-                // letting execution fail later as a misleading configuration error.
-                let end_exec_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let key = TaskKey {
-                    job_id: task.job_id.clone(),
-                    stage_id: task.stage_id,
-                    task_id: task.task_id,
-                };
-                let task_status = as_task_status(
-                    Err(BallistaError::GrpcConnectionError(format!(
-                        "failed to connect to scheduler {scheduler_id} for pipelined shuffle metadata: {e}"
-                    ))),
-                    self.executor.metadata.id.clone(),
-                    task.stage_attempt_num,
-                    key,
-                    TaskExecutionTimes {
-                        launch_time: task.launch_time,
-                        start_exec_time,
-                        end_exec_time,
-                    },
-                    TaskCompletionExtras::default(),
-                );
-                let _ = self
-                    .executor_env
-                    .tx_task_status
-                    .send(CuratorTaskStatus {
-                        scheduler_id,
-                        task_status,
-                    })
-                    .await;
-                return;
-            }
-            Err(e) => {
-                debug!(
-                    "Task {task_identity} does not require live shuffle metadata;                      continuing after scheduler client lookup failed: {e:?}"
-                );
+                }
+                Err(e) => {
+                    // Without this client a pipelined reader cannot make progress. Report
+                    // the setup failure explicitly as retryable connectivity instead of
+                    // letting execution fail later as a misleading configuration error.
+                    let end_exec_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    let key = TaskKey {
+                        job_id: task.job_id.clone(),
+                        stage_id: task.stage_id,
+                        task_id: task.task_id,
+                    };
+                    let task_status = as_task_status(
+                        Err(BallistaError::GrpcConnectionError(format!(
+                            "failed to connect to scheduler {scheduler_id} for pipelined shuffle metadata: {e}"
+                        ))),
+                        self.executor.metadata.id.clone(),
+                        task.stage_attempt_num,
+                        key,
+                        TaskExecutionTimes {
+                            launch_time: task.launch_time,
+                            start_exec_time,
+                            end_exec_time,
+                        },
+                        TaskCompletionExtras::default(),
+                    );
+                    let _ = self
+                        .executor_env
+                        .tx_task_status
+                        .send(CuratorTaskStatus {
+                            scheduler_id,
+                            task_status,
+                        })
+                        .await;
+                    return;
+                }
             }
         }
 

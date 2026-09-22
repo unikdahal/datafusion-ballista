@@ -71,6 +71,8 @@ pub fn producing_input_observed(job_id: &str, stage_id: u32, generation: u64) ->
 /// Runtime-only discovery transport; physical plans serialize only the handle.
 #[async_trait]
 pub trait ShuffleInputClient: Debug + Send + Sync {
+    /// Open a partition snapshot when `after` is absent, or poll for changes
+    /// after its generation-local cursor. Never switch generations implicitly.
     async fn update(
         &self,
         handle: pb::ShuffleInputHandle,
@@ -679,9 +681,12 @@ where
 #[derive(Debug, Clone)]
 pub struct ShuffleInputRuntime(pub Arc<dyn ShuffleInputClient>);
 
+/// Reads a bounded, generation-pinned shuffle as materialized outputs arrive.
 #[derive(Debug, Clone)]
 pub struct PipelinedShuffleReaderExec {
+    /// Producer history this consumer must use throughout its task attempt.
     pub handle: pb::ShuffleInputHandle,
+    /// Original producer output IDs, indexed by task-local partition number.
     pub upstream_partition_ids: Vec<usize>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -691,6 +696,7 @@ pub struct PipelinedShuffleReaderExec {
 }
 
 impl PipelinedShuffleReaderExec {
+    /// Build a reader with a nonempty, unique local-to-upstream partition map.
     pub fn try_new(
         handle: pb::ShuffleInputHandle,
         upstream_partition_ids: Vec<usize>,
@@ -728,6 +734,7 @@ impl PipelinedShuffleReaderExec {
         })
     }
 
+    /// Attach executor-local file access and the optional shared client pool.
     pub fn with_fetch_runtime(
         &self,
         work_dir: String,
