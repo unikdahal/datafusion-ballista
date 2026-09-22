@@ -70,6 +70,7 @@ mod tests {
     use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
     struct ScriptedSource {
@@ -597,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_after_consumption_never_mixes_generations() -> Result<()> {
+    async fn materialized_replay_surfaces_invalidation() -> Result<()> {
         materialized_replay(true).await
     }
 }
