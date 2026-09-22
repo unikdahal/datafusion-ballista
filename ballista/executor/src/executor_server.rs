@@ -1130,8 +1130,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn push_path_detects_pipelined_reader_and_installs_metadata_runtime() {
+    #[tokio::test]
+    async fn push_path_detects_pipelined_reader_and_installs_metadata_runtime() {
         let mut task = pipelined_task();
         assert!(plan_requires_shuffle_metadata(&task.plan));
         assert!(
