@@ -909,8 +909,7 @@ mod tests {
 
         registry.commit(&job, 1, 2, 2, vec![location(2, 0), location(2, 1)])?;
         assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
-        let ShuffleInputRead::Update(snapshot) =
-            registry.read(&job, 1, 2, 0, &[0, 1])?
+        let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 2, 0, &[0, 1])?
         else {
             panic!()
         };
