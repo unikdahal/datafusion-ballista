@@ -1142,8 +1142,7 @@ mod test {
                 .is_none()
         );
 
-        let channel =
-            Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
+        let channel = Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
         install_shuffle_input_runtime(&mut task, SchedulerGrpcClient::new(channel));
 
         assert!(
