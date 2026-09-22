@@ -61,7 +61,15 @@ message BallistaPhysicalPlanNode {
     RangeFilterExecNode range_filter = 13;
     PrefixMergeExecNode prefix_merge = 14;
     RangeShuffleWriterExecNode range_shuffle_writer = 15;
+    PipelinedShuffleReaderExecNode pipelined_shuffle_reader = 16;
   }
+}
+
+message PipelinedShuffleReaderExecNode {
+  ShuffleInputHandle handle = 1;
+  repeated uint32 upstream_partition_ids = 2;
+  datafusion_common.Schema schema = 3;
+  datafusion.Partitioning partitioning = 4;
 }
 
 // Value-range router over N locally-sorted overlapping input partitions.

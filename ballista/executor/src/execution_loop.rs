@@ -107,7 +107,13 @@ pub async fn poll_loop<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan,
     health: crate::health::ExecutorHealth,
 ) -> Result<(), BallistaError>
 where
-    C: tonic::client::GrpcService<tonic::body::Body>,
+    C: tonic::client::GrpcService<tonic::body::Body>
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    C::Future: Send,
     C::Error: Into<StdError>,
     C::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <C::ResponseBody as Body>::Error: Into<StdError> + Send,
@@ -221,6 +227,7 @@ where
                         task.clone(),
                         &codec,
                         &dedicated_executor,
+                        Arc::new(scheduler.clone()),
                     )
                     .await
                     {
@@ -314,6 +321,9 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     task: TaskDefinition,
     codec: &BallistaCodec<T, U>,
     dedicated_executor: &DedicatedExecutor,
+    shuffle_client: Arc<
+        dyn ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputClient,
+    >,
 ) -> Result<(), BallistaError> {
     let task_id = task.task_id;
     let task_attempt_num = task.task_attempt_num;
@@ -335,7 +345,13 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         task_identity, task.props
     );
     let session_config = executor.produce_config();
-    let session_config = session_config.update_from_key_value_pair(&task.props);
+    let session_config = session_config
+        .update_from_key_value_pair(&task.props)
+        .with_extension(Arc::new(
+            ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime(
+                shuffle_client,
+            ),
+        ));
 
     let task_scalar_functions = executor.function_registry.scalar_functions.clone();
     let task_aggregate_functions = executor.function_registry.aggregate_functions.clone();
