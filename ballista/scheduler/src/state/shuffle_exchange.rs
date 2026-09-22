@@ -649,7 +649,7 @@ mod tests {
             .artifacts_after(epoch, 0, ShuffleExchangeSequence::INITIAL)
             .unwrap();
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].location(), &artifact);
+        assert!(same_artifact_location(visible[0].location(), &artifact));
     }
 
     #[test]
