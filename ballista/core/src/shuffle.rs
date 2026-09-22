@@ -24,16 +24,22 @@
 //! [ShuffleExchangeEpoch].
 //!
 //! Epochs are scoped to a [ShuffleExchangeId]. An epoch value has no meaning
-//! independently of the exchange that owns it, and an epoch must never be reused
-//! for the same exchange while a reader or writer from an older materialized
-//! history may still exist. A recovery implementation must therefore preserve
-//! the current epoch across scheduler reconstruction or invalidate all
-//! pre-recovery exchange handles before restarting the epoch space.
+//! independently of the exchange that owns it. The pair is represented by
+//! [ShuffleExchangeGeneration], which is the fencing identity for one valid
+//! materialized history.
+//!
+//! For the lifetime of a logical exchange identity, the same epoch value must
+//! never identify two different materialized histories. Scheduler reconstruction
+//! must therefore recover the current epoch/allocation state, advance to a fresh
+//! epoch, or abandon the old logical identity. Merely invalidating known handles
+//! is insufficient because delayed messages or disconnected readers may still
+//! carry an older generation.
 //!
 //! [ShuffleExchangeSequence] is an epoch-local event position. Sequence zero
 //! means "before the first event", and the first visible event uses sequence one.
-//! Consumers should retain an epoch and its sequence together as a
-//! [ShuffleExchangeCursor] rather than updating the two values independently.
+//! Consumers retain the generation and observed event position together as a
+//! [ShuffleExchangeCursor]. Consumers do not allocate sequence numbers; the
+//! scheduler owns that monotonic event space.
 //!
 //! These types intentionally contain no scheduler state, transport contracts,
 //! or recovery policy. They are shared vocabulary for those layers.
@@ -83,9 +89,11 @@ impl ShuffleExchangeId {
 /// an "unset" value at serialization boundaries and makes stale/uninitialized
 /// handles fail closed instead of accidentally naming a real history.
 ///
-/// For one exchange, epoch values must not be reused while handles to an older
-/// history can still exist. Scheduler recovery must preserve that monotonicity
-/// or explicitly invalidate every pre-recovery handle before restarting it.
+/// For one logical exchange identity, an epoch value must never be reused for a
+/// different materialized history. Scheduler recovery must preserve the current
+/// allocation state, advance to a fresh epoch, or replace/abandon the logical
+/// exchange identity. Resetting the epoch space after invalidating only known
+/// handles is unsafe because stale handles and delayed messages can still exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShuffleExchangeEpoch(NonZeroU64);
 
@@ -146,49 +154,92 @@ impl ShuffleExchangeSequence {
     }
 }
 
+/// Fencing identity for one materialized history of a logical shuffle exchange.
+///
+/// The numeric epoch is intentionally never used as a standalone generation
+/// identity because equal epoch values on different exchanges are unrelated.
+/// Keeping the logical exchange identity and epoch together prevents routing or
+/// reconnect code from accidentally validating a handle against the wrong
+/// exchange.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShuffleExchangeGeneration {
+    exchange_id: ShuffleExchangeId,
+    epoch: ShuffleExchangeEpoch,
+}
+
+impl ShuffleExchangeGeneration {
+    /// Creates a materialized-history generation for one logical exchange.
+    pub fn new(exchange_id: ShuffleExchangeId, epoch: ShuffleExchangeEpoch) -> Self {
+        Self { exchange_id, epoch }
+    }
+
+    /// Creates the first materialized-history generation for an exchange.
+    pub fn initial(exchange_id: ShuffleExchangeId) -> Self {
+        Self::new(exchange_id, ShuffleExchangeEpoch::INITIAL)
+    }
+
+    /// Returns the logical exchange this generation belongs to.
+    pub fn exchange_id(&self) -> &ShuffleExchangeId {
+        &self.exchange_id
+    }
+
+    /// Returns the epoch that fences this materialized history.
+    pub const fn epoch(&self) -> ShuffleExchangeEpoch {
+        self.epoch
+    }
+}
+
 /// Consumer position within one materialized history of a shuffle exchange.
 ///
-/// Keeping epoch and sequence in one value prevents subscription and reconnect
-/// code from independently refreshing the epoch while accidentally retaining a
-/// sequence from an older history. New epochs always start from
-/// [ShuffleExchangeSequence::INITIAL]; callers advance a cursor without
-/// changing its epoch.
+/// A cursor carries the complete generation identity together with the last
+/// scheduler-issued event sequence observed by a consumer. This prevents
+/// subscription and reconnect code from pairing a sequence from one history
+/// with another exchange or epoch.
 ///
-/// A cursor is still scoped to the [ShuffleExchangeId] that owns its epoch.
-/// The exchange identity remains a separate routing/keying dimension.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Consumers may reconstruct a cursor at any observed sequence, for example
+/// when decoding a reconnect request. They must not generate sequence numbers
+/// themselves: sequence allocation belongs to the scheduler's exchange state.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShuffleExchangeCursor {
-    epoch: ShuffleExchangeEpoch,
+    generation: ShuffleExchangeGeneration,
     sequence: ShuffleExchangeSequence,
 }
 
 impl ShuffleExchangeCursor {
-    /// Creates the initial consumer position for epoch.
-    pub const fn initial(epoch: ShuffleExchangeEpoch) -> Self {
+    /// Reconstructs a cursor at an already-observed scheduler event position.
+    pub fn new(
+        generation: ShuffleExchangeGeneration,
+        sequence: ShuffleExchangeSequence,
+    ) -> Self {
         Self {
-            epoch,
-            sequence: ShuffleExchangeSequence::INITIAL,
+            generation,
+            sequence,
         }
     }
 
+    /// Creates the initial consumer position for a materialized generation.
+    pub fn initial(generation: ShuffleExchangeGeneration) -> Self {
+        Self::new(generation, ShuffleExchangeSequence::INITIAL)
+    }
+
+    /// Returns the materialized generation this cursor belongs to.
+    pub fn generation(&self) -> &ShuffleExchangeGeneration {
+        &self.generation
+    }
+
+    /// Returns the logical exchange this cursor belongs to.
+    pub fn exchange_id(&self) -> &ShuffleExchangeId {
+        self.generation.exchange_id()
+    }
+
     /// Returns the materialized-history epoch this cursor belongs to.
-    pub const fn epoch(self) -> ShuffleExchangeEpoch {
-        self.epoch
+    pub const fn epoch(&self) -> ShuffleExchangeEpoch {
+        self.generation.epoch()
     }
 
-    /// Returns the last observed event sequence in this epoch.
-    pub const fn sequence(self) -> ShuffleExchangeSequence {
+    /// Returns the last observed scheduler-issued event sequence.
+    pub const fn sequence(&self) -> ShuffleExchangeSequence {
         self.sequence
-    }
-
-    /// Advances this cursor by one event without changing its epoch.
-    ///
-    /// Returns None if the sequence space is exhausted.
-    pub fn checked_next(self) -> Option<Self> {
-        self.sequence.checked_next().map(|sequence| Self {
-            epoch: self.epoch,
-            sequence,
-        })
     }
 }
 
@@ -270,32 +321,70 @@ mod tests {
     }
 
     #[test]
-    fn cursor_keeps_epoch_and_sequence_together() {
+    fn generation_binds_exchange_and_epoch() {
+        let exchange_a = ShuffleExchangeId::new(JobId::from("job-a"), 3);
+        let exchange_b = ShuffleExchangeId::new(JobId::from("job-a"), 4);
         let epoch_one = ShuffleExchangeEpoch::INITIAL;
-        let cursor = ShuffleExchangeCursor::initial(epoch_one);
-
-        assert_eq!(cursor.epoch(), epoch_one);
-        assert_eq!(cursor.sequence(), ShuffleExchangeSequence::INITIAL);
-
-        let next = cursor.checked_next().unwrap();
-        assert_eq!(next.epoch(), epoch_one);
-        assert_eq!(next.sequence(), ShuffleExchangeSequence::new(1));
-
         let epoch_two = epoch_one.checked_next().unwrap();
-        let fresh = ShuffleExchangeCursor::initial(epoch_two);
-        assert_eq!(fresh.epoch(), epoch_two);
-        assert_eq!(fresh.sequence(), ShuffleExchangeSequence::INITIAL);
-        assert_ne!(next, fresh);
+
+        let a1 = ShuffleExchangeGeneration::new(exchange_a.clone(), epoch_one);
+        let a2 = ShuffleExchangeGeneration::new(exchange_a.clone(), epoch_two);
+        let b1 = ShuffleExchangeGeneration::new(exchange_b, epoch_one);
+
+        assert_eq!(a1.exchange_id(), &exchange_a);
+        assert_eq!(a1.epoch(), epoch_one);
+        assert_ne!(a1, a2);
+        assert_ne!(a1, b1);
+        assert_eq!(
+            ShuffleExchangeGeneration::initial(exchange_a),
+            ShuffleExchangeGeneration::new(
+                ShuffleExchangeId::new(JobId::from("job-a"), 3),
+                ShuffleExchangeEpoch::INITIAL,
+            )
+        );
     }
 
     #[test]
-    fn cursor_never_wraps_sequence() {
-        let epoch = ShuffleExchangeEpoch::INITIAL;
-        let mut cursor = ShuffleExchangeCursor::initial(epoch);
-        cursor.sequence = ShuffleExchangeSequence::new(u64::MAX);
+    fn cursor_reconstructs_arbitrary_observed_position() {
+        let exchange = ShuffleExchangeId::new(JobId::from("job-a"), 3);
+        let generation =
+            ShuffleExchangeGeneration::new(exchange.clone(), ShuffleExchangeEpoch::INITIAL);
+        let cursor = ShuffleExchangeCursor::new(
+            generation.clone(),
+            ShuffleExchangeSequence::new(137),
+        );
 
-        assert_eq!(cursor.checked_next(), None);
-        assert_eq!(cursor.epoch(), epoch);
+        assert_eq!(cursor.generation(), &generation);
+        assert_eq!(cursor.exchange_id(), &exchange);
+        assert_eq!(cursor.epoch(), ShuffleExchangeEpoch::INITIAL);
+        assert_eq!(cursor.sequence(), ShuffleExchangeSequence::new(137));
+    }
+
+    #[test]
+    fn cursor_identity_includes_exchange_epoch_and_sequence() {
+        let epoch_one = ShuffleExchangeEpoch::INITIAL;
+        let epoch_two = epoch_one.checked_next().unwrap();
+
+        let exchange_a = ShuffleExchangeId::new(JobId::from("job-a"), 3);
+        let exchange_b = ShuffleExchangeId::new(JobId::from("job-a"), 4);
+
+        let a1 = ShuffleExchangeCursor::new(
+            ShuffleExchangeGeneration::new(exchange_a.clone(), epoch_one),
+            ShuffleExchangeSequence::new(7),
+        );
+        let b1 = ShuffleExchangeCursor::new(
+            ShuffleExchangeGeneration::new(exchange_b, epoch_one),
+            ShuffleExchangeSequence::new(7),
+        );
+        let a2 = ShuffleExchangeCursor::initial(ShuffleExchangeGeneration::new(
+            exchange_a,
+            epoch_two,
+        ));
+
+        assert_ne!(a1, b1);
+        assert_ne!(a1, a2);
+        assert_eq!(a2.epoch(), epoch_two);
+        assert_eq!(a2.sequence(), ShuffleExchangeSequence::INITIAL);
     }
 
     #[test]
