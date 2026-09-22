@@ -42,7 +42,7 @@
 //! scheduler owns that monotonic event space.
 //!
 //! These types intentionally contain no scheduler state, transport contracts,
-//! or recovery policy. They are shared vocabulary for those layers.
+//! or recovery implementation. They are shared vocabulary for those layers.
 
 use std::num::NonZeroU64;
 
@@ -54,6 +54,11 @@ use crate::JobId;
 /// same logical stage still produces the same exchange. Only invalidation of
 /// previously accepted materialized output advances that exchange to a new
 /// [ShuffleExchangeEpoch].
+///
+/// The stage id uses Ballista's native in-memory `usize` representation, matching
+/// existing scheduler and `PartitionId` state. Transport/storage adapters remain
+/// responsible for checked conversion to narrower wire representations such as
+/// protobuf `uint32`; this domain type must never rely on truncating casts.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShuffleExchangeId {
     job_id: JobId,
