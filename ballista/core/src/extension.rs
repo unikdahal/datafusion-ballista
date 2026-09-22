@@ -245,8 +245,9 @@ pub trait SessionConfigExt {
 
     /// Is adaptive query planner enabled
     fn ballista_adaptive_query_planner_enabled(&self) -> bool;
-    /// Enable experimental static pipelined shuffle.
+    /// Returns whether experimental static pipelined shuffle is enabled.
     fn ballista_shuffle_pipelined_enabled(&self) -> bool;
+    /// Enables or disables experimental static pipelined shuffle.
     fn with_ballista_shuffle_pipelined_enabled(self, enabled: bool) -> Self;
 
     /// Enables or disables adaptive query planning (enabled by default).
