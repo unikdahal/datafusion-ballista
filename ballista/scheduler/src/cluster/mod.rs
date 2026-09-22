@@ -681,7 +681,7 @@ mod test {
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
         mock_completed_task, mock_executor, revive_graph_and_complete_next_stage,
-        test_two_aggregations_plan_with_config,
+        test_aggregation_plan_with_config, test_two_aggregations_plan_with_config,
     };
     use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
     use ballista_core::extension::SessionConfigExt;
