@@ -27,9 +27,12 @@ coalesced readers, and the externally visible final stage retain their barriers.
 The scheduler publishes locations only after accepting a producer task's success.
 All outputs from that task share a publication version. A reader pins one
 generation, discovers snapshots and deltas through scheduler RPCs, and delegates
-physical reads to the existing shuffle fetch engine. Neither shuffle file formats
-nor Flight data transport change. Empty producing snapshots mean wait; only a
-sealed and drained history permits EOF. Optimizer statistics remain unknown.
+physical reads to the existing shuffle fetch engine. Metadata polling remains
+active while a finite local/Flight fetch is draining, so generation invalidation
+or admission revocation can interrupt a slow read instead of waiting for that
+fetch to finish. Neither shuffle file formats nor Flight data transport change.
+Empty producing snapshots mean wait; only a sealed and drained history permits
+EOF. Optimizer statistics remain unknown.
 
 Both built-in binders allocate normal work across jobs first. Tail work uses
 remaining executor vcores only when each unsealed producer has committed data and
@@ -42,7 +45,9 @@ that stop reading early (for example LIMIT).
 The current scheduler backend is in memory. A scheduler restart closes the live
 job and requires job resubmission; generations are not restored from persistence.
 Custom distribution policies must explicitly call the admission-aware graph
-interface to support early scheduling.
+interface to support early scheduling. The legacy running-stage interface remains
+normal-work-only when pipelining is enabled, so an unmodified custom policy falls
+back safely to blocking behavior instead of bypassing tail admission.
 
 ## Review stack
 
@@ -60,8 +65,9 @@ interface to support early scheduling.
 Validation runs in the `Pipelined shuffle validation` GitHub Actions workflow.
 Pushes to the shuffle review branches rerun validation automatically; a manual
 `stack` run checks every review branch independently. The workflow checks
-formatting, runs core and scheduler unit tests, compiles executor targets, and,
-once present on a branch, runs the end-to-end validation.
+formatting, runs core and scheduler unit tests, compiles executor targets,
+executes the push-executor metadata-runtime wiring test, and, once present on a
+branch, runs the end-to-end validation.
 
 The end-to-end tests compare feature-off/on results for local and forced Flight
 fetches and inspect reader metrics to prove at least one feature-on reader polled
