@@ -584,8 +584,10 @@ impl Debug for UnresolvedStage {
 /// Scheduling mode is independent of structural plan eligibility.
 #[derive(Debug, Clone, Default)]
 pub enum StageAdmission {
+    /// Ordinary barrier-based scheduling.
     #[default]
     Normal,
+    /// Revocable early scheduling pinned to the listed producer generations.
     TailPipelined(Vec<ballista_core::serde::protobuf::ShuffleInputHandle>),
 }
 
