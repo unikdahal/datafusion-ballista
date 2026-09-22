@@ -688,7 +688,8 @@ mod test {
     use datafusion::prelude::SessionConfig;
 
     #[tokio::test]
-    async fn pipelined_fresh_graph_binds_source_work_without_manual_revive() -> Result<()> {
+    async fn pipelined_fresh_graph_binds_source_work_without_manual_revive() -> Result<()>
+    {
         let job_id = JobId::from("fresh-pipelined-job");
         let session_config = Arc::new(
             SessionConfig::new_with_ballista()
@@ -708,12 +709,11 @@ mod test {
             executor_id: "executor_0".to_string(),
             vcores: 4,
         }];
-        let bound = bind_task_bias(
-            budgets.iter_mut().collect(),
-            Arc::new(active_jobs),
-            |_| false,
-        )
-        .await;
+        let bound =
+            bind_task_bias(budgets.iter_mut().collect(), Arc::new(active_jobs), |_| {
+                false
+            })
+            .await;
 
         assert!(
             !bound.is_empty(),
@@ -955,8 +955,7 @@ mod test {
                 bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false).await
             }
             TestBinder::RoundRobin => {
-                bind_task_round_robin(budgets_ref, Arc::new(active_jobs), |_| false)
-                    .await
+                bind_task_round_robin(budgets_ref, Arc::new(active_jobs), |_| false).await
             }
         }
     }
@@ -1036,7 +1035,9 @@ mod test {
         complete_bound_task(cache, bound).await
     }
 
-    fn contains_pipelined_reader(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> bool {
+    fn contains_pipelined_reader(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> bool {
         if plan.is::<ballista_core::execution_plans::PipelinedShuffleReaderExec>() {
             return true;
         }
@@ -1072,10 +1073,8 @@ mod test {
         let producer_stage =
             commit_one_producer_task(policy, &tail_job, &tail_cache).await?;
         let tail_jobs = HashMap::from([(tail_job.clone(), tail_cache)]);
-        let remaining = pending_normal_tasks(
-            tail_jobs.get(&tail_job).expect("tail job cache"),
-        )
-        .await;
+        let remaining =
+            pending_normal_tasks(tail_jobs.get(&tail_job).expect("tail job cache")).await;
         assert!(
             remaining > 0,
             "fixture must retain producer pending work after the first commit"
@@ -1119,8 +1118,7 @@ mod test {
             commit_one_producer_task(policy, &ready_tail_job, &ready_tail_cache).await?;
         let ready_tail_only =
             HashMap::from([(ready_tail_job.clone(), ready_tail_cache.clone())]);
-        let remaining =
-            pending_normal_tasks(&ready_tail_cache).await;
+        let remaining = pending_normal_tasks(&ready_tail_cache).await;
         assert!(remaining > 0);
         let drained = bind_with_policy(
             policy,
