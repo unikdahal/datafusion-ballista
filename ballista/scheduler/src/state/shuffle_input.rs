@@ -115,9 +115,16 @@ pub struct ShuffleGenerationState {
     version: u64,
     lifecycle: ShuffleInputLifecycle,
     blocks: HashMap<ShuffleBlockKey, PublishedShuffleLocation>,
+    // Hot-path index: output partition -> append-ordered (version, block key).
+    // Readers normally ask for one output partition, so metadata polling is
+    // proportional to that partition's delta instead of scanning every block
+    // in the producer stage.
+    partition_index: HashMap<usize, Vec<(u64, ShuffleBlockKey)>>,
     // Successful task publication is the idempotence boundary, including an
-    // accepted empty result. Values are canonicalized by ShuffleBlockKey.
-    accepted_tasks: HashMap<usize, Vec<PartitionLocation>>,
+    // accepted empty result. Store canonical keys rather than a second full
+    // copy of every PartitionLocation; exact replay validation dereferences the
+    // authoritative block map.
+    accepted_tasks: HashMap<usize, Vec<ShuffleBlockKey>>,
     notify: Arc<Notify>,
 }
 
@@ -128,6 +135,7 @@ impl ShuffleGenerationState {
             version: 0,
             lifecycle: ShuffleInputLifecycle::Producing,
             blocks: HashMap::new(),
+            partition_index: HashMap::new(),
             accepted_tasks: HashMap::new(),
             notify: Arc::new(Notify::new()),
         }
@@ -209,8 +217,20 @@ impl ShuffleInputRegistry {
         let publication = canonical_publication(job, stage, task, locations)?;
         let state = self.current(job, stage, generation)?;
 
-        if let Some(previous) = state.accepted_tasks.get(&task) {
-            if previous == &publication {
+        if let Some(previous_keys) = state.accepted_tasks.get(&task) {
+            let exact_replay = previous_keys.len() == publication.len()
+                && previous_keys
+                    .iter()
+                    .zip(publication.iter())
+                    .all(|(previous_key, location)| {
+                        let key = ShuffleBlockKey::from(location);
+                        previous_key == &key
+                            && state
+                                .blocks
+                                .get(previous_key)
+                                .is_some_and(|block| block.location == *location)
+                    });
+            if exact_replay {
                 return Ok(PreparedShuffleCommit {
                     job: job.clone(),
                     stage,
@@ -280,24 +300,30 @@ impl ShuffleInputRegistry {
         }
 
         if prepared.publication.is_empty() {
-            state
-                .accepted_tasks
-                .insert(prepared.task, prepared.publication);
+            state.accepted_tasks.insert(prepared.task, vec![]);
             return state.version;
         }
 
+        let mut publication_keys = Vec::with_capacity(prepared.publication.len());
         for location in &prepared.publication {
+            let key = ShuffleBlockKey::from(location);
             state.blocks.insert(
-                ShuffleBlockKey::from(location),
+                key,
                 PublishedShuffleLocation {
                     published_version: prepared.version,
                     location: location.clone(),
                 },
             );
+            state
+                .partition_index
+                .entry(key.output_partition_id)
+                .or_default()
+                .push((prepared.version, key));
+            publication_keys.push(key);
         }
         state
             .accepted_tasks
-            .insert(prepared.task, prepared.publication);
+            .insert(prepared.task, publication_keys);
         state.version = prepared.version;
         state.notify.notify_waiters();
         state.version
@@ -366,9 +392,23 @@ impl ShuffleInputRegistry {
         state
             .accepted_tasks
             .retain(|task, _| !lost_tasks.contains(task));
-        for block in state.blocks.values_mut() {
+
+        // A generation rollover rebases every surviving publication to version
+        // 1. Rebuild the partition index from the authoritative block map so
+        // no key from the retired generation can remain reachable.
+        state.partition_index.clear();
+        for (key, block) in state.blocks.iter_mut() {
             block.published_version = 1;
+            state
+                .partition_index
+                .entry(key.output_partition_id)
+                .or_default()
+                .push((1, *key));
         }
+        for entries in state.partition_index.values_mut() {
+            entries.sort_by_key(|(_, key)| *key);
+        }
+
         state.generation = next;
         state.version = 1;
         state.lifecycle = ShuffleInputLifecycle::Producing;
@@ -378,8 +418,9 @@ impl ShuffleInputRegistry {
 
     /// Reads locations newer than `after` for the requested output partitions.
     ///
-    /// The selection is normalized once so scanning B committed blocks costs
-    /// O(P + B), rather than O(P * B), for P requested partitions.
+    /// Publications are indexed by output partition and version. A reducer poll
+    /// therefore touches only the requested partitions' new suffixes instead
+    /// of scanning the producer stage's complete M x R block map.
     pub fn read(
         &self,
         job: &JobId,
@@ -420,15 +461,23 @@ impl ShuffleInputRegistry {
             });
         }
 
-        let mut locations: Vec<_> = state
-            .blocks
-            .values()
-            .filter(|block| {
-                block.published_version > after
-                    && partitions.contains(&block.location.partition_id.partition_id)
-            })
-            .cloned()
-            .collect();
+        let mut locations = Vec::new();
+        for partition in partitions {
+            let Some(entries) = state.partition_index.get(partition) else {
+                continue;
+            };
+            // Entries are append ordered by generation-local version. A
+            // rollover rebuilds the index with surviving blocks at version 1.
+            let first_new = entries.partition_point(|(version, _)| *version <= after);
+            for (_, key) in &entries[first_new..] {
+                let block = state.blocks.get(key).ok_or_else(|| {
+                    invariant("shuffle partition index references a missing block")
+                })?;
+                locations.push(block.clone());
+            }
+        }
+        // Preserve the old deterministic cross-partition ordering for callers
+        // that request more than one output partition.
         locations.sort_by_key(|block| {
             (
                 block.published_version,
@@ -669,6 +718,50 @@ mod tests {
         assert_eq!(registry.commit(&job, 1, 1, 1, vec![location(1, 0)])?, 1);
         // Replay returns the current global version but does not advance it.
         assert_eq!(registry.commit(&job, 1, 1, 0, vec![])?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_index_returns_only_requested_new_suffix() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+
+        registry.commit(
+            &job,
+            1,
+            1,
+            0,
+            vec![location(0, 0), location(0, 1), location(0, 2)],
+        )?;
+        registry.commit(
+            &job,
+            1,
+            1,
+            1,
+            vec![location(1, 0), location(1, 1), location(1, 2)],
+        )?;
+
+        let state = registry.get(&job, 1).unwrap();
+        assert_eq!(state.partition_index.len(), 3);
+        assert_eq!(state.partition_index[&0].len(), 2);
+        assert_eq!(state.partition_index[&1].len(), 2);
+        assert_eq!(state.partition_index[&2].len(), 2);
+
+        let ShuffleInputRead::Update(snapshot) =
+            registry.read(&job, 1, 1, 1, &[1])?
+        else {
+            panic!()
+        };
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.locations.len(), 1);
+        assert_eq!(snapshot.locations[0].published_version, 2);
+        assert_eq!(snapshot.locations[0].location.map_partition_id, 1);
+        assert_eq!(
+            snapshot.locations[0].location.partition_id.partition_id,
+            1
+        );
+
         Ok(())
     }
 
