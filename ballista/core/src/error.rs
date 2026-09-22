@@ -405,9 +405,11 @@ impl From<BallistaError> for FailedTask {
                     "Task setup failed because scheduler shuffle metadata is unavailable: {desc}"
                 ),
                 retryable: true,
-                // A scheduler/control-plane outage is not evidence that this
-                // partition itself is bad, so do not burn the task retry budget.
-                count_to_failures: false,
+                // Bound persistent reverse-connectivity or scheduler endpoint
+                // misconfiguration with the normal task retry policy. Unlike
+                // generation invalidation/admission revocation, this is an
+                // availability failure that may never self-heal.
+                count_to_failures: true,
                 failed_reason: Some(FailedReason::IoError(IoError {})),
             },
             ref e if is_retryable_io(e) => {
@@ -441,12 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_metadata_setup_failure_is_retryable_without_penalizing_task() {
+    fn scheduler_metadata_setup_failure_is_retryable_and_bounded() {
         let failed = FailedTask::from(BallistaError::SchedulerMetadataUnavailable(
             "unavailable".into(),
         ));
         assert!(failed.retryable);
-        assert!(!failed.count_to_failures);
+        assert!(failed.count_to_failures);
         assert!(matches!(
             failed.failed_reason,
             Some(FailedReason::IoError(_))
