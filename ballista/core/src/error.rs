@@ -59,6 +59,10 @@ pub enum BallistaError {
     GrpcError(Box<tonic::Status>),
     /// gRPC connection failure.
     GrpcConnectionError(String),
+    /// Executor could not establish the scheduler metadata channel required by
+    /// a pipelined shuffle task. This is control-plane availability, not
+    /// evidence that the task's data or computation is bad.
+    SchedulerMetadataUnavailable(String),
     /// Tokio task join error.
     TokioError(tokio::task::JoinError),
     /// gRPC action error.
@@ -211,6 +215,9 @@ impl Display for BallistaError {
             BallistaError::GrpcError(desc) => write!(f, "Grpc error: {desc}"),
             BallistaError::GrpcConnectionError(desc) => {
                 write!(f, "Grpc connection error: {desc}")
+            }
+            BallistaError::SchedulerMetadataUnavailable(desc) => {
+                write!(f, "Scheduler shuffle-metadata unavailable: {desc}")
             }
             BallistaError::Internal(desc) => {
                 write!(f, "Internal Ballista error: {desc}")
@@ -393,8 +400,10 @@ impl From<BallistaError> for FailedTask {
                 count_to_failures: false,
                 failed_reason: Some(FailedReason::TaskKilled(TaskKilled {})),
             },
-            BallistaError::GrpcConnectionError(desc) => FailedTask {
-                error: format!("Task setup failed due to scheduler connectivity: {desc}"),
+            BallistaError::SchedulerMetadataUnavailable(desc) => FailedTask {
+                error: format!(
+                    "Task setup failed because scheduler shuffle metadata is unavailable: {desc}"
+                ),
                 retryable: true,
                 // A scheduler/control-plane outage is not evidence that this
                 // partition itself is bad, so do not burn the task retry budget.
@@ -432,14 +441,27 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_connection_failure_is_retryable_without_penalizing_task() {
-        let failed =
-            FailedTask::from(BallistaError::GrpcConnectionError("unavailable".into()));
+    fn scheduler_metadata_setup_failure_is_retryable_without_penalizing_task() {
+        let failed = FailedTask::from(BallistaError::SchedulerMetadataUnavailable(
+            "unavailable".into(),
+        ));
         assert!(failed.retryable);
         assert!(!failed.count_to_failures);
         assert!(matches!(
             failed.failed_reason,
             Some(FailedReason::IoError(_))
+        ));
+    }
+
+    #[test]
+    fn generic_grpc_connection_failure_is_not_reclassified_as_metadata_outage() {
+        let failed =
+            FailedTask::from(BallistaError::GrpcConnectionError("unavailable".into()));
+        assert!(!failed.retryable);
+        assert!(!failed.count_to_failures);
+        assert!(matches!(
+            failed.failed_reason,
+            Some(FailedReason::ExecutionError(_))
         ));
     }
 
