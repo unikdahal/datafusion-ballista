@@ -81,6 +81,32 @@ const HEARTBEAT_FAILURE_TERMINATION_THRESHOLD: u32 = 5;
 type ServerHandle = JoinHandle<Result<(), BallistaError>>;
 type SchedulerClients = Arc<DashMap<String, SchedulerGrpcClient<Channel>>>;
 
+/// Whether a pushed task needs a live scheduler metadata channel at runtime.
+///
+/// Keep this recursive check outside `run_task` so the push path can be tested
+/// independently of network setup and so future plan wrappers cannot silently
+/// hide a pipelined reader from runtime injection.
+fn plan_requires_shuffle_metadata(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> bool {
+    plan.is::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
+        || plan
+            .children()
+            .into_iter()
+            .any(plan_requires_shuffle_metadata)
+}
+
+fn install_shuffle_input_runtime(
+    task: &mut TaskDefinition,
+    client: SchedulerGrpcClient<Channel>,
+) {
+    task.session_config = task.session_config.clone().with_extension(Arc::new(
+        ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime(
+            Arc::new(client),
+        ),
+    ));
+}
+
 /// Wrap TaskDefinition with its curator scheduler id for task update to its specific curator scheduler later
 #[derive(Debug)]
 struct CuratorTaskDefinition {
@@ -392,24 +418,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         debug!("Start to run task {task_identity}");
         let scheduler_id = curator_task.scheduler_id.clone();
         let mut task = curator_task.task;
-        let requires_shuffle_metadata = {
-            fn contains_pipelined_reader(
-                plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-            ) -> bool {
-                plan.is::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
-                    || plan.children().into_iter().any(contains_pipelined_reader)
-            }
-            contains_pipelined_reader(&task.plan)
-        };
 
-        if requires_shuffle_metadata {
+        if plan_requires_shuffle_metadata(&task.plan) {
             match self.get_scheduler_client(&scheduler_id).await {
                 Ok(client) => {
-                    task.session_config = task.session_config.with_extension(Arc::new(
-                    ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime(
-                        Arc::new(client),
-                    ),
-                ));
+                    install_shuffle_input_runtime(&mut task, client);
                 }
                 Err(e) => {
                     // Without this client a pipelined reader cannot make progress. Report
@@ -1074,4 +1087,71 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+    use ballista_core::JobId;
+    use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+    use ballista_core::extension::SessionConfigExt;
+    use ballista_core::registry::BallistaFunctionRegistry;
+    use ballista_core::serde::protobuf::ShuffleInputHandle;
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::prelude::SessionConfig;
+    use tonic::transport::Endpoint;
+
+    fn pipelined_task() -> TaskDefinition {
+        let plan = Arc::new(
+            PipelinedShuffleReaderExec::try_new(
+                ShuffleInputHandle {
+                    job_id: "job".into(),
+                    stage_id: 1,
+                    generation: 1,
+                },
+                vec![0],
+                Arc::new(Schema::empty()),
+                Partitioning::UnknownPartitioning(1),
+            )
+            .unwrap(),
+        );
+
+        TaskDefinition {
+            task_id: 0,
+            task_attempt_num: 0,
+            job_id: JobId::from("job"),
+            stage_id: 2,
+            stage_attempt_num: 0,
+            global_output_partition_ids: vec![0],
+            vcores_consumed: 1,
+            plan,
+            launch_time: 0,
+            session_id: "session".into(),
+            session_config: SessionConfig::new_with_ballista(),
+            function_registry: Arc::new(BallistaFunctionRegistry::default()),
+        }
+    }
+
+    #[test]
+    fn push_path_detects_pipelined_reader_and_installs_metadata_runtime() {
+        let mut task = pipelined_task();
+        assert!(plan_requires_shuffle_metadata(&task.plan));
+        assert!(
+            task.session_config
+                .get_extension::<
+                    ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime,
+                >()
+                .is_none()
+        );
+
+        let channel =
+            Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
+        install_shuffle_input_runtime(&mut task, SchedulerGrpcClient::new(channel));
+
+        assert!(
+            task.session_config
+                .get_extension::<
+                    ballista_core::execution_plans::pipelined_shuffle_reader::ShuffleInputRuntime,
+                >()
+                .is_some()
+        );
+    }
+}
