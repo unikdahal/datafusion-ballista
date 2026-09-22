@@ -1012,8 +1012,7 @@ mod test {
                     .unwrap(),
             );
         }
-        let source: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::try_new(sources).unwrap());
+        let source: Arc<dyn ExecutionPlan> = UnionExec::try_new(sources).unwrap();
         let partitioning = Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 4);
         let first_shuffle: Arc<dyn ExecutionPlan> =
             Arc::new(RepartitionExec::try_new(source, partitioning.clone()).unwrap());
