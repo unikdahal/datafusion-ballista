@@ -55,6 +55,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use log::warn;
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Restrict `plan` so that its leaves only see the given `partitions`, unless
@@ -110,7 +111,7 @@ fn restrict(
     // `under_collect`, every descendant reads the full upstream anyway,
     // so the generic recursion below applies instead.
     if !under_collect && plan.is::<UnionExec>() {
-        let per_child = union_child_partitions(&plan, partitions);
+        let per_child = union_child_partitions(&plan, partitions)?;
         let new_children: Vec<Arc<dyn ExecutionPlan>> = plan
             .children()
             .into_iter()
@@ -140,12 +141,15 @@ fn restrict(
 fn union_child_partitions(
     plan: &Arc<dyn ExecutionPlan>,
     partitions: &[usize],
-) -> Vec<Vec<usize>> {
+) -> Result<Vec<Vec<usize>>> {
     let child_counts: Vec<usize> = plan
         .children()
         .iter()
         .map(|c| c.properties().output_partitioning().partition_count())
         .collect();
+    let total_partition_count = child_counts.iter().sum();
+    validate_partition_indices(partitions, total_partition_count, "UnionExec")?;
+
     let mut per_child: Vec<Vec<usize>> = vec![vec![]; child_counts.len()];
     for &p in partitions {
         let mut remaining = p;
@@ -157,7 +161,7 @@ fn union_child_partitions(
             remaining -= count;
         }
     }
-    per_child
+    Ok(per_child)
 }
 
 /// The `under_collect` value to pass to each child of `plan`.
@@ -219,8 +223,14 @@ fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool>
 ///
 /// - `new.output_partitioning().partition_count() == indices.len()`
 /// - `new.execute(j)` ≡ `plan.execute(indices[j])`
-/// - `Partitioning` kind is preserved (`Hash(exprs, N) → Hash(exprs, |S|)`,
-///   `RoundRobinBatch(N) → RoundRobinBatch(|S|)`, `Unknown(N) → Unknown(|S|)`).
+/// - only an exact identity selection `[0, 1, ..., N-1]` preserves the
+///   original partitioning claim. An arbitrary subset or permutation is
+///   conservatively exposed as `UnknownPartitioning(indices.len())`: local
+///   reindexing does not turn original hash/round-robin buckets into a new
+///   standard hash/round-robin partitioning.
+/// - duplicate and out-of-range indices are rejected for recognized leaves,
+///   except broadcast ShuffleReaderExec, whose execute(n) intentionally aliases
+///   every caller index to its single logical partition.
 /// - `new.schema() == plan.schema()`
 ///
 /// `None` means "unrecognised plan type — no idea how." The caller decides
@@ -250,27 +260,107 @@ fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool>
 /// a leaf below a `CoalescePartitionsExec` / `SortPreservingMergeExec` /
 /// join build side must read its full upstream) lives in the walker —
 /// the walker simply doesn't call this function under collapse.
+fn validate_partition_indices(
+    indices: &[usize],
+    partition_count: usize,
+    plan_name: &str,
+) -> Result<()> {
+    let mut seen = HashSet::with_capacity(indices.len());
+    for &index in indices {
+        if index >= partition_count {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "{plan_name} partition {index} out of bounds for {partition_count} partitions"
+            )));
+        }
+        if !seen.insert(index) {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "{plan_name} partition {index} selected more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Project a partitioning claim through a local partition-index selection.
+///
+/// Only the identity selection preserves DataFusion's semantic partitioning
+/// contract. For example, original hash buckets [2, 6] of 8 are not the two
+/// buckets of Hash(exprs, 2), and a permutation such as [6, 2] is not
+/// Hash(exprs, 8) either. The physical mapping is retained by the leaf itself;
+/// the property exposed to downstream operators must therefore be conservative.
+fn projected_partitioning(partitioning: &Partitioning, indices: &[usize]) -> Partitioning {
+    let original_count = partitioning.partition_count();
+    if indices.len() == original_count
+        && indices.iter().copied().eq(0..original_count)
+    {
+        partitioning.clone()
+    } else {
+        Partitioning::UnknownPartitioning(indices.len())
+    }
+}
+
 fn select_output_partitions(
     plan: &Arc<dyn ExecutionPlan>,
     indices: &[usize],
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if let Some(reader) =
+        plan.downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
+    {
+        validate_partition_indices(
+            indices,
+            reader.upstream_partition_ids.len(),
+            "PipelinedShuffleReaderExec",
+        )?;
+
+        // A pipelined descriptor intentionally rejects zero partitions, but a
+        // UnionExec child can legitimately receive an empty local slice. Use
+        // the same serializable zero-partition stub as the self-generating
+        // leaves below so the idle union child remains unpolled.
+        if indices.is_empty() {
+            let stub = MemorySourceConfig::try_new(&[], reader.schema(), None)?;
+            return Ok(Some(DataSourceExec::from_data_source(stub)));
+        }
+
+        let selected = indices
+            .iter()
+            .map(|&index| reader.upstream_partition_ids[index])
+            .collect::<Vec<_>>();
+        let partitioning = match reader.properties().output_partitioning() {
+            Partitioning::Range(_) => {
+                return internal_err!("pipelined range shuffle is unsupported");
+            }
+            partitioning => projected_partitioning(partitioning, indices),
+        };
+
+        // This rewrite is scheduler-side, before plan serialization and before
+        // executor-only fetch runtime is injected. Reconstructing with
+        // try_new is therefore intentional; ExecutionEngine injects work_dir
+        // and client_pool after the restricted plan reaches the executor.
+        return Ok(Some(Arc::new(
+            ballista_core::execution_plans::PipelinedShuffleReaderExec::try_new(
+                reader.handle.clone(),
+                selected,
+                reader.schema(),
+                partitioning,
+            )?,
+        )));
+    }
     // ShuffleReaderExec: cross-stage inputs.
     if let Some(reader) = plan.downcast_ref::<ShuffleReaderExec>() {
-        // Broadcast readers serve everything from partition[0] for every
-        // consumer — slicing would drop the payload. Leave intact.
+        // Broadcast readers are the deliberate exception to ordinary
+        // partition-index validation: execute(n) aliases every caller index
+        // to the single logical partition[0], so task-local indices such as
+        // [1] are valid even though output_partitioning() reports one logical
+        // partition. Slicing would drop the broadcast payload; leave it intact.
         if reader.broadcast {
             return Ok(Some(plan.clone()));
         }
+        validate_partition_indices(indices, reader.partition.len(), "ShuffleReaderExec")?;
         let kept: Vec<Vec<_>> = indices
             .iter()
-            .filter_map(|&p| reader.partition.get(p).cloned())
+            .map(|&p| reader.partition[p].clone())
             .collect();
         let partitioning = match reader.properties().output_partitioning() {
-            Partitioning::Hash(exprs, _) => Partitioning::Hash(exprs.clone(), kept.len()),
-            Partitioning::RoundRobinBatch(_) => Partitioning::RoundRobinBatch(kept.len()),
-            Partitioning::UnknownPartitioning(_) => {
-                Partitioning::UnknownPartitioning(kept.len())
-            }
             // TODO: map DataFusion's `Partitioning::Range` (new in 55) onto
             // Ballista's own range shuffle. Restricting one means slicing its
             // split points alongside the partition slice, the way the
@@ -286,6 +376,7 @@ fn select_output_partitions(
                     reader.stage_id
                 );
             }
+            partitioning => projected_partitioning(partitioning, indices),
         };
         let Ok(restricted) = ShuffleReaderExec::try_new(
             reader.stage_id,
@@ -302,9 +393,14 @@ fn select_output_partitions(
     // partition-slice restriction as ShuffleReaderExec — carry the merge
     // ordering unchanged.
     if let Some(reader) = plan.downcast_ref::<RangeShuffleReaderExec>() {
+        validate_partition_indices(
+            indices,
+            reader.partition.len(),
+            "RangeShuffleReaderExec",
+        )?;
         let kept: Vec<Vec<_>> = indices
             .iter()
-            .filter_map(|&p| reader.partition.get(p).cloned())
+            .map(|&p| reader.partition[p].clone())
             .collect();
         let Ok(restricted) = RangeShuffleReaderExec::try_new(
             reader.stage_id,
@@ -320,9 +416,14 @@ fn select_output_partitions(
         // sources whole — right answer, none of the saving.
         let restricted = match reader.bounds() {
             Some(bounds) => {
+                validate_partition_indices(
+                    indices,
+                    bounds.len(),
+                    "RangeShuffleReaderExec bounds",
+                )?;
                 let kept = indices
                     .iter()
-                    .filter_map(|&p| bounds.get(p).cloned())
+                    .map(|&p| bounds[p].clone())
                     .collect();
                 let Ok(restricted) = restricted.with_bounds(kept) else {
                     return Ok(None);
@@ -338,9 +439,14 @@ fn select_output_partitions(
     if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
         let source: &dyn Any = exec.data_source().as_ref();
         if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+            validate_partition_indices(
+                indices,
+                config.file_groups.len(),
+                "FileScanConfig",
+            )?;
             let file_groups: Vec<FileGroup> = indices
                 .iter()
-                .filter_map(|&i| config.file_groups.get(i).cloned())
+                .map(|&i| config.file_groups[i].clone())
                 .collect();
             let restricted = FileScanConfigBuilder::from(config.clone())
                 .with_file_groups(file_groups)
@@ -348,9 +454,14 @@ fn select_output_partitions(
             return Ok(Some(DataSourceExec::from_data_source(restricted)));
         }
         if let Some(config) = source.downcast_ref::<MemorySourceConfig>() {
+            validate_partition_indices(
+                indices,
+                config.partitions().len(),
+                "MemorySourceConfig",
+            )?;
             let kept: Vec<Vec<_>> = indices
                 .iter()
-                .filter_map(|&i| config.partitions().get(i).cloned())
+                .map(|&i| config.partitions()[i].clone())
                 .collect();
             let Ok(restricted) = MemorySourceConfig::try_new(
                 &kept,
@@ -403,6 +514,135 @@ fn select_output_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+    use ballista_core::serde::protobuf::ShuffleInputHandle;
+
+    fn pipelined_reader(partitioning: Partitioning) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            PipelinedShuffleReaderExec::try_new(
+                ShuffleInputHandle {
+                    job_id: "job".into(),
+                    stage_id: 1,
+                    generation: 7,
+                },
+                (0..8).collect(),
+                Arc::new(Schema::new(vec![Field::new(
+                    "a",
+                    DataType::Int32,
+                    false,
+                )])),
+                partitioning,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn pipelined_reader_keeps_global_identity_and_downgrades_hash_subset() -> Result<()> {
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::Column;
+
+        let hash_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let reader = pipelined_reader(Partitioning::Hash(vec![hash_expr], 8));
+        let restricted = restrict_plan_to_partitions(reader, &[2, 6])?;
+        let sliced = restricted
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .unwrap();
+
+        assert_eq!(sliced.upstream_partition_ids, vec![2, 6]);
+        assert!(matches!(
+            sliced.properties().output_partitioning(),
+            Partitioning::UnknownPartitioning(2)
+        ));
+
+        // Scheduler slicing reconstructs a descriptor without executor-only
+        // runtime fields; executor injection happens afterwards and must work
+        // on the sliced mapping.
+        let injected = sliced.with_fetch_runtime("/tmp/ballista".into(), None);
+        assert_eq!(injected.upstream_partition_ids, vec![2, 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_reader_downgrades_round_robin_and_preserves_identity_slice() -> Result<()> {
+        let reader = pipelined_reader(Partitioning::RoundRobinBatch(8));
+        let restricted = restrict_plan_to_partitions(reader, &[1, 5])?;
+        let sliced = restricted
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .unwrap();
+        assert_eq!(sliced.upstream_partition_ids, vec![1, 5]);
+        assert!(matches!(
+            sliced.properties().output_partitioning(),
+            Partitioning::UnknownPartitioning(2)
+        ));
+
+        let reader = pipelined_reader(Partitioning::RoundRobinBatch(8));
+        let restricted =
+            restrict_plan_to_partitions(reader, &(0..8).collect::<Vec<_>>())?;
+        assert!(matches!(
+            restricted.properties().output_partitioning(),
+            Partitioning::RoundRobinBatch(8)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_reader_preserves_requested_order_and_rejects_bad_indices() -> Result<()> {
+        let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
+        let restricted = restrict_plan_to_partitions(reader, &[6, 2])?;
+        let sliced = restricted
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .unwrap();
+        assert_eq!(sliced.upstream_partition_ids, vec![6, 2]);
+
+        let duplicate = restrict_plan_to_partitions(
+            pipelined_reader(Partitioning::UnknownPartitioning(8)),
+            &[2, 2],
+        )
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("selected more than once"));
+
+        let out_of_bounds = restrict_plan_to_partitions(
+            pipelined_reader(Partitioning::UnknownPartitioning(8)),
+            &[8],
+        )
+        .unwrap_err();
+        assert!(out_of_bounds.to_string().contains("out of bounds"));
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_reader_empty_union_slice_becomes_zero_partition_stub() -> Result<()> {
+        let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
+        let restricted = restrict_plan_to_partitions(reader, &[])?;
+        assert_eq!(
+            restricted.properties().output_partitioning().partition_count(),
+            0
+        );
+        assert!(restricted.downcast_ref::<DataSourceExec>().is_some());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn collect_scope_remains_sticky_through_partition_preserving_operator() -> Result<()> {
+        use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+
+        let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
+        let preserving: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalesceBatchesExec::new(reader, 8192));
+        let collapsed: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(preserving));
+
+        let restricted = restrict_plan_to_partitions(collapsed, &[0])?;
+        let preserving = restricted.children()[0].clone();
+        let reader = preserving.children()[0]
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .unwrap();
+        assert_eq!(reader.upstream_partition_ids, (0..8).collect::<Vec<_>>());
+
+        Ok(())
+    }
     use ballista_core::JobId;
     use ballista_core::execution_plans::{
         CoalescePlan, PartitionGroup, ShuffleReaderExec,
@@ -473,6 +713,15 @@ mod tests {
         assert_eq!(r.partition.len(), 2);
         assert_eq!(r.partition[0][0].partition_id.partition_id, 0);
         assert_eq!(r.partition[1][0].partition_id.partition_id, 3);
+    }
+
+    #[test]
+    fn blocking_reader_rejects_duplicate_and_out_of_range_indices() {
+        let duplicate = restrict_plan_to_partitions(shuffle_reader(4), &[1, 1]).unwrap_err();
+        assert!(duplicate.to_string().contains("selected more than once"));
+
+        let out_of_bounds = restrict_plan_to_partitions(shuffle_reader(4), &[4]).unwrap_err();
+        assert!(out_of_bounds.to_string().contains("out of bounds"));
     }
 
     #[test]
@@ -638,6 +887,23 @@ mod tests {
                 counts[idle]
             );
         }
+    }
+
+    #[test]
+    fn union_rejects_duplicate_and_out_of_range_parent_partitions() {
+        let make_union = || -> Arc<dyn ExecutionPlan> {
+            UnionExec::try_new(vec![
+                scan_with_file_groups(2),
+                scan_with_file_groups(2),
+            ])
+            .unwrap()
+        };
+
+        let duplicate = restrict_plan_to_partitions(make_union(), &[1, 1]).unwrap_err();
+        assert!(duplicate.to_string().contains("selected more than once"));
+
+        let out_of_bounds = restrict_plan_to_partitions(make_union(), &[4]).unwrap_err();
+        assert!(out_of_bounds.to_string().contains("out of bounds"));
     }
 
     /// Without a union a partition passes straight through, so the behaviour
