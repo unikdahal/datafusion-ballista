@@ -235,7 +235,7 @@ type Result<T> = std::result::Result<T, ShuffleExchangeError>;
 ///
 /// Epoch rollover preserves usable producer output while invalidating every
 /// reader pinned to the retired materialized history.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ShuffleExchangeState {
     id: ShuffleExchangeId,
     cursor: ShuffleExchangeCursor,
