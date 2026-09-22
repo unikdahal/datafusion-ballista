@@ -1888,6 +1888,23 @@ impl ExecutionGraph for StaticExecutionGraph {
             return None;
         }
 
+        // Preserve the legacy API as a safe normal-work-only interface when
+        // pipelining is enabled. Existing custom distribution policies may call
+        // fetch_running_stage directly; exposing a TailPipelined stage here
+        // would let them bypass global normal-first admission and the producer
+        // readiness checks. Such policies keep working conservatively (without
+        // overlap) until they explicitly adopt fetch_running_stage_for_admission.
+        if self.pipelining_enabled() {
+            let mut selected = self.running_stage_for_admission_id(black_list, false);
+            if selected.is_none() && self.revive() {
+                selected = self.running_stage_for_admission_id(black_list, false);
+            }
+            return match selected.and_then(|id| self.stages.get_mut(&id)) {
+                Some(ExecutionStage::Running(stage)) => Some(stage),
+                _ => None,
+            };
+        }
+
         let running_stage_id = self.get_running_stage_id(black_list);
         if let Some(running_stage_id) = running_stage_id {
             if let Some(ExecutionStage::Running(running_stage)) =
@@ -2617,6 +2634,49 @@ mod test {
             plan: stage.plan.clone(),
             session_config: stage.session_config.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_running_stage_api_never_exposes_tail_work() -> Result<()> {
+        let mut graph = pipelined_test_graph().await;
+        let executor = mock_executor("producer".into());
+
+        // Publish one producer task, then assign every remaining producer
+        // partition without completing it. That makes the intermediate
+        // consumer tail-eligible: committed history exists and producer
+        // pending is empty, but the producer has not sealed.
+        let first = graph.pop_next_task(&executor.id)?.unwrap();
+        graph.update_task_status(
+            &executor,
+            vec![mock_completed_task(first, &executor.id)],
+            4,
+            4,
+        )?;
+        loop {
+            let Some(stage) = graph.fetch_running_stage_for_admission(&[], false) else {
+                break;
+            };
+            let partitions = stage.pending.next_slice(1);
+            if partitions.is_empty() {
+                break;
+            }
+            let task_id = stage.task_infos.len();
+            let mut info =
+                super::create_task_info("producer-straggler".into(), task_id);
+            info.global_input_partition_ids = partitions;
+            info.vcores_consumed = 1;
+            stage.task_infos.push(info);
+        }
+
+        assert!(
+            graph.fetch_running_stage(&[]).is_none(),
+            "legacy custom-policy API must not expose revocable tail work"
+        );
+        assert!(
+            graph.fetch_running_stage_for_admission(&[], true).is_some(),
+            "admission-aware API should expose the eligible tail"
+        );
+        Ok(())
     }
 
     #[tokio::test]
