@@ -1296,7 +1296,61 @@ message RunningTaskInfo {
   uint32 stage_id = 3;
 }
 
+enum ShuffleInputLifecycle {
+  SHUFFLE_INPUT_PRODUCING = 0;
+  SHUFFLE_INPUT_SEALED = 1;
+}
+
+message ShuffleInputHandle {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint64 generation = 3;
+}
+
+message VersionedPartitionLocation {
+  uint64 published_version = 1;
+  PartitionLocation location = 2;
+}
+
+message ShuffleInputUpdate {
+  uint64 generation = 1;
+  uint64 version = 2;
+  ShuffleInputLifecycle lifecycle = 3;
+  repeated VersionedPartitionLocation locations = 4;
+}
+
+message ShuffleGenerationInvalidated {
+  uint64 expected_generation = 1;
+  uint64 current_generation = 2;
+}
+
+message OpenShuffleInputParams {
+  ShuffleInputHandle handle = 1;
+  // Selection is set-like: duplicate ids do not duplicate returned locations.
+  repeated uint32 output_partition_ids = 2;
+}
+
+message PollShuffleInputParams {
+  ShuffleInputHandle handle = 1;
+  uint64 after_version = 2;
+  // Selection is set-like: duplicate ids do not duplicate returned locations.
+  repeated uint32 output_partition_ids = 3;
+  // The scheduler clamps this value to 30 seconds.
+  uint32 max_wait_ms = 4;
+}
+
+// Job/input closure is reported as NOT_FOUND. This result only describes an
+// active handle: either its current generation or an explicit rollover.
+message ShuffleInputResult {
+  oneof result {
+    ShuffleInputUpdate update = 1;
+    ShuffleGenerationInvalidated invalidated = 2;
+  }
+}
+
 service SchedulerGrpc {
+  rpc OpenShuffleInput(OpenShuffleInputParams) returns (ShuffleInputResult) {}
+  rpc PollShuffleInput(PollShuffleInputParams) returns (ShuffleInputResult) {}
   // Executors must poll the scheduler for heartbeat and to receive tasks
   rpc PollWork (PollWorkParams) returns (PollWorkResult) {}
 

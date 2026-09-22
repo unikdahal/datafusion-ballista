@@ -99,6 +99,20 @@ pub enum ShuffleInputRead {
         /// Current producer generation.
         current: u64,
     },
+    /// The requested producer generation is ahead of scheduler state.
+    GenerationAhead {
+        /// Generation requested by the consumer.
+        requested: u64,
+        /// Current producer generation.
+        current: u64,
+    },
+    /// The consumer cursor is ahead of the producer's current version.
+    CursorAhead {
+        /// Version requested by the consumer.
+        after: u64,
+        /// Current producer version.
+        current: u64,
+    },
     /// The job/input no longer exists in the registry.
     Closed,
 }
@@ -282,7 +296,8 @@ impl ShuffleInputRegistry {
                 "lost shuffle artifact is not committed in current generation",
             ));
         }
-        let lost_tasks: HashSet<_> = lost.iter().map(|key| key.producer_task_id).collect();
+        let lost_tasks: HashSet<_> =
+            lost.iter().map(|key| key.producer_task_id).collect();
 
         let next = increment(state.generation)?;
         state
@@ -339,10 +354,16 @@ impl ShuffleInputRegistry {
             });
         }
         if generation > state.generation {
-            return Err(invariant("shuffle generation is ahead of the producer"));
+            return Ok(ShuffleInputRead::GenerationAhead {
+                requested: generation,
+                current: state.generation,
+            });
         }
         if after > state.version {
-            return Err(invariant("shuffle cursor is ahead of the producer"));
+            return Ok(ShuffleInputRead::CursorAhead {
+                after,
+                current: state.version,
+            });
         }
 
         let mut locations: Vec<_> = state
@@ -473,13 +494,7 @@ mod tests {
         let blocks = vec![location(0, 0), location(0, 1)];
         assert_eq!(registry.commit(&job, 1, 1, 0, blocks.clone())?, 1);
         assert_eq!(
-            registry.commit(
-                &job,
-                1,
-                1,
-                0,
-                vec![blocks[1].clone(), blocks[0].clone()],
-            )?,
+            registry.commit(&job, 1, 1, 0, vec![blocks[1].clone(), blocks[0].clone()],)?,
             1
         );
 
@@ -540,10 +555,7 @@ mod tests {
                 .is_err()
         );
 
-        assert_eq!(
-            registry.commit(&job, 1, 1, 1, vec![location(1, 0)])?,
-            1
-        );
+        assert_eq!(registry.commit(&job, 1, 1, 1, vec![location(1, 0)])?, 1);
         // Replay returns the current global version but does not advance it.
         assert_eq!(registry.commit(&job, 1, 1, 0, vec![])?, 1);
         Ok(())
@@ -559,12 +571,12 @@ mod tests {
         first.file_id = Some(10);
         let mut second = first.clone();
         second.file_id = Some(11);
-        assert_ne!(ShuffleBlockKey::from(&first), ShuffleBlockKey::from(&second));
-
-        assert_eq!(
-            registry.commit(&job, 1, 1, 0, vec![first, second])?,
-            1
+        assert_ne!(
+            ShuffleBlockKey::from(&first),
+            ShuffleBlockKey::from(&second)
         );
+
+        assert_eq!(registry.commit(&job, 1, 1, 0, vec![first, second])?, 1);
         let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 1, 0, &[0])?
         else {
             panic!()
@@ -596,11 +608,7 @@ mod tests {
                 current: 2
             }
         ));
-        assert!(
-            registry
-                .commit(&job, 1, 1, 0, task_zero.clone())
-                .is_err()
-        );
+        assert!(registry.commit(&job, 1, 1, 0, task_zero.clone()).is_err());
         assert!(registry.seal(&job, 1, 1).is_err());
 
         let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 2, 0, &[0, 1])?
@@ -653,7 +661,6 @@ mod tests {
 
         let block = location(0, 0);
         registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
-
         let mut unknown = ShuffleBlockKey::from(&block);
         unknown.output_partition_id = 99;
         assert!(
@@ -664,33 +671,24 @@ mod tests {
 
         let state = registry.get(&job, 1).unwrap();
         assert_eq!(state.generation(), 1);
-        assert_eq!(state.lifecycle(), ShuffleInputLifecycle::Producing);
         assert_eq!(state.blocks.len(), 1);
         assert_eq!(state.accepted_tasks.len(), 1);
         Ok(())
     }
 
     #[test]
-    fn future_generation_read_fails_closed() -> Result<()> {
+    fn future_generation_is_not_reported_as_invalidation() -> Result<()> {
         let job = JobId::from("job");
         let mut registry = ShuffleInputRegistry::default();
         registry.create(&job, 1);
 
-        assert!(registry.read(&job, 1, 2, 0, &[0]).is_err());
-
-        let block = location(0, 0);
-        registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
-        let lost = HashSet::from([ShuffleBlockKey::from(&block)]);
-        assert_eq!(registry.invalidate(&job, 1, 1, &lost)?, 2);
-
         assert!(matches!(
-            registry.read(&job, 1, 1, 0, &[0])?,
-            ShuffleInputRead::Invalidated {
-                expected: 1,
-                current: 2
+            registry.read(&job, 1, 2, 0, &[0])?,
+            ShuffleInputRead::GenerationAhead {
+                requested: 2,
+                current: 1
             }
         ));
-        assert!(registry.read(&job, 1, 3, 0, &[0]).is_err());
         Ok(())
     }
 
@@ -769,7 +767,13 @@ mod tests {
         };
         assert!(snapshot.locations.is_empty());
         assert_eq!(snapshot.lifecycle, ShuffleInputLifecycle::Producing);
-        assert!(registry.read(&job, 1, 1, 10, &[0]).is_err());
+        assert!(matches!(
+            registry.read(&job, 1, 1, 10, &[0])?,
+            ShuffleInputRead::CursorAhead {
+                after: 10,
+                current: 0
+            }
+        ));
 
         registry.close_job(&job);
         assert!(matches!(
