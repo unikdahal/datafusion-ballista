@@ -504,12 +504,8 @@ mod tests {
     fn pipelined_recovery_errors_survive_datafusion_wrappers() {
         let tail_cases = [
             BallistaError::TailAdmissionRevoked { stage_id: 7 },
-            wrap_in_shared_external(BallistaError::TailAdmissionRevoked {
-                stage_id: 7,
-            }),
-            wrap_in_context_external(BallistaError::TailAdmissionRevoked {
-                stage_id: 7,
-            }),
+            wrap_in_shared_external(BallistaError::TailAdmissionRevoked { stage_id: 7 }),
+            wrap_in_context_external(BallistaError::TailAdmissionRevoked { stage_id: 7 }),
         ];
         for error in tail_cases {
             let task = FailedTask::from(error);
