@@ -1269,8 +1269,7 @@ impl ExecutionGraph for StaticExecutionGraph {
         // under pipelined execution, or it may already be Successful under the
         // traditional barrier path; defer the state-specific transition until
         // all reports in this batch have been applied.
-        let mut lost_materialized_tasks: HashMap<usize, HashSet<usize>> =
-            HashMap::new();
+        let mut lost_materialized_tasks: HashMap<usize, HashSet<usize>> = HashMap::new();
 
         for (stage_id, stage_task_statuses) in job_task_statuses {
             if let Some(stage) = self.stages.get_mut(&stage_id) {
@@ -1385,10 +1384,9 @@ impl ExecutionGraph for StaticExecutionGraph {
                                                 .or_insert_with(HashSet::new);
                                             failure_reasons.insert(executor_id);
 
-                                            let lost_tasks =
-                                                lost_materialized_tasks
-                                                    .entry(map_stage_id)
-                                                    .or_default();
+                                            let lost_tasks = lost_materialized_tasks
+                                                .entry(map_stage_id)
+                                                .or_default();
                                             lost_tasks.extend(removed_map_partitions);
                                             warn!(
                                                 "Need to resubmit the current running Stage {stage_id} and its map Stage {map_stage_id} due to FetchPartitionError from task {task_identity}"
@@ -1758,9 +1756,8 @@ impl ExecutionGraph for StaticExecutionGraph {
                         ) {
                             task_info.task_status =
                                 task_status::Status::Failed(FailedTask {
-                                    error:
-                                        "FetchPartitionError in downstream stage"
-                                            .to_owned(),
+                                    error: "FetchPartitionError in downstream stage"
+                                        .to_owned(),
                                     retryable: true,
                                     count_to_failures: false,
                                     failed_reason: Some(FailedReason::ResultLost(
@@ -2987,8 +2984,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn pipelined_fetch_failure_retires_output_from_running_producer()
-    -> Result<()> {
+    async fn pipelined_fetch_failure_retires_output_from_running_producer() -> Result<()>
+    {
         let mut graph = pipelined_test_graph().await;
         let producer_executor = mock_executor("producer-with-lost-output".into());
 
@@ -3062,9 +3059,7 @@ mod test {
             })
         ));
         assert!(
-            producer
-                .pending
-                .remaining()
+            producer.pending.remaining()
                 >= producer.task_infos[first_task_id]
                     .global_input_partition_ids
                     .len(),
