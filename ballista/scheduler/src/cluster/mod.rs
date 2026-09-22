@@ -677,14 +677,23 @@ mod test {
 
     use crate::cluster::stage_has_input_collapse;
     use crate::cluster::{BoundTask, bind_task_bias, bind_task_round_robin};
+    use crate::planner::DefaultDistributedPlanner;
     use crate::state::execution_graph::{ExecutionGraph, StaticExecutionGraph};
     use crate::state::task_manager::JobInfoCache;
     use crate::test_utils::{
         mock_completed_task, mock_executor, revive_graph_and_complete_next_stage,
-        test_aggregation_plan_with_config, test_two_aggregations_plan_with_config,
+        test_aggregation_plan_with_config,
     };
     use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
     use ballista_core::extension::SessionConfigExt;
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{ExecutionPlan, Partitioning};
     use datafusion::prelude::SessionConfig;
 
     #[tokio::test]
@@ -946,8 +955,48 @@ mod test {
                 .with_ballista_shuffle_pipelined_enabled(true)
                 .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1"),
         );
-        let graph =
-            test_two_aggregations_plan_with_config(4, job_id, session_config).await;
+
+        // Build the admission topology directly as a physical plan instead of
+        // depending on optimizer output from an aggregate fixture. Four Union
+        // partitions feed the first shuffle, so the source stage is
+        // deterministically non-collapse and a one-partition bind leaves
+        // producer work pending. A second shuffle creates the intermediate
+        // consumer needed for tail admission.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let mut sources: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        for partition in 0..4 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![partition]))],
+            )
+            .unwrap();
+            sources.push(
+                MemorySourceConfig::try_new_exec(&[vec![batch]], schema.clone(), None)
+                    .unwrap(),
+            );
+        }
+        let source: Arc<dyn ExecutionPlan> = UnionExec::try_new(sources).unwrap();
+        let partitioning = Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 4);
+        let first_shuffle: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(source, partitioning.clone()).unwrap());
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(first_shuffle, partitioning).unwrap());
+
+        let mut planner = DefaultDistributedPlanner::new();
+        let graph = StaticExecutionGraph::new(
+            "localhost:50050",
+            job_id,
+            "",
+            "session",
+            plan,
+            0,
+            session_config,
+            &mut planner,
+            None,
+        )
+        .unwrap();
+
         // Deliberately return the untouched builder result. The real binder
         // must preserve the legacy Resolved -> Running revival transition.
         JobInfoCache::new(Box::new(graph))
