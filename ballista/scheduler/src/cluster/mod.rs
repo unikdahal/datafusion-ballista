@@ -1008,24 +1008,17 @@ mod test {
             )
             .unwrap();
             sources.push(
-                MemorySourceConfig::try_new_exec(
-                    &[vec![batch]],
-                    schema.clone(),
-                    None,
-                )
-                .unwrap(),
+                MemorySourceConfig::try_new_exec(&[vec![batch]], schema.clone(), None)
+                    .unwrap(),
             );
         }
         let source: Arc<dyn ExecutionPlan> =
             Arc::new(UnionExec::try_new(sources).unwrap());
-        let partitioning =
-            Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 4);
-        let first_shuffle: Arc<dyn ExecutionPlan> = Arc::new(
-            RepartitionExec::try_new(source, partitioning.clone()).unwrap(),
-        );
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            RepartitionExec::try_new(first_shuffle, partitioning).unwrap(),
-        );
+        let partitioning = Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 4);
+        let first_shuffle: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(source, partitioning.clone()).unwrap());
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(first_shuffle, partitioning).unwrap());
 
         let mut planner = DefaultDistributedPlanner::new();
         let graph = StaticExecutionGraph::new(
