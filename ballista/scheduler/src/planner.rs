@@ -2129,8 +2129,7 @@ order by
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::physical_plan::Partitioning;
 
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)]));
         let reader = Arc::new(PipelinedShuffleReaderExec::try_new(
             ShuffleInputHandle {
                 job_id: "job".to_string(),
@@ -2156,7 +2155,10 @@ order by
         assert_eq!(unresolved.stage_id, 42);
         assert_eq!(unresolved.output_partition_count, 4);
         assert_eq!(
-            unresolved.properties().output_partitioning().partition_count(),
+            unresolved
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             4
         );
 
