@@ -425,8 +425,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                         task_id: task.task_id,
                     };
                     let task_status = as_task_status(
-                        Err(BallistaError::GrpcConnectionError(format!(
-                            "failed to connect to scheduler {scheduler_id} for pipelined shuffle metadata: {e}"
+                        Err(BallistaError::SchedulerMetadataUnavailable(format!(
+                            "failed to connect to scheduler {scheduler_id}: {e}"
                         ))),
                         self.executor.metadata.id.clone(),
                         task.stage_attempt_num,
