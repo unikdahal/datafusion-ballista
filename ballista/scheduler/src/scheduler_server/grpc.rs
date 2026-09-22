@@ -1235,22 +1235,24 @@ mod test {
         let registry = Arc::new(parking_lot::Mutex::new(ShuffleInputRegistry::default()));
         registry.lock().create(&job, 1);
 
+        let location = shuffle_location(&job, 0, 0);
+        let lost = HashSet::from([ShuffleBlockKey::from(&location)]);
+        registry
+            .lock()
+            .commit(&job, 1, 1, 0, vec![location])
+            .unwrap();
+
         let waiter = tokio::spawn(poll_shuffle_input_registry(
             registry.clone(),
             job.clone(),
             1,
             1,
-            0,
+            1,
             HashSet::from([0]),
             30_000,
         ));
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let lost = HashSet::from([ShuffleBlockKey {
-            producer_task_id: 0,
-            output_partition_id: 0,
-            file_id: None,
-        }]);
         registry.lock().invalidate(&job, 1, 1, &lost).unwrap();
 
         let response = tokio::time::timeout(Duration::from_secs(1), waiter)
