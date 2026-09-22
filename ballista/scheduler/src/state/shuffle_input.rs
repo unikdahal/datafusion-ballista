@@ -640,7 +640,11 @@ mod tests {
         let mut distinct_attempt = first;
         distinct_attempt.file_id = Some(99);
         distinct_attempt.executor_meta.id = "retry-executor".into();
-        assert!(registry.commit(&job, 1, 1, 0, vec![distinct_attempt]).is_err());
+        assert!(
+            registry
+                .commit(&job, 1, 1, 0, vec![distinct_attempt])
+                .is_err()
+        );
 
         let state = registry.get(&job, 1).unwrap();
         assert_eq!(state.generation(), 1);
@@ -659,7 +663,11 @@ mod tests {
         registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
         let mut unknown = ShuffleBlockKey::from(&block);
         unknown.output_partition_id = 99;
-        assert!(registry.invalidate(&job, 1, 1, &HashSet::from([unknown])).is_err());
+        assert!(
+            registry
+                .invalidate(&job, 1, 1, &HashSet::from([unknown]))
+                .is_err()
+        );
 
         let state = registry.get(&job, 1).unwrap();
         assert_eq!(state.generation(), 1);
