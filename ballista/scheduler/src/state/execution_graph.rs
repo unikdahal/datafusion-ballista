@@ -697,10 +697,8 @@ impl StaticExecutionGraph {
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
 
-        let pipelining_requested =
-            session_config.ballista_shuffle_pipelined_enabled();
-        let adaptive_enabled =
-            session_config.ballista_adaptive_query_planner_enabled();
+        let pipelining_requested = session_config.ballista_shuffle_pipelined_enabled();
+        let adaptive_enabled = session_config.ballista_adaptive_query_planner_enabled();
         if pipelining_requested && !PIPELINED_SHUFFLE_RECOVERY_READY {
             warn!(
                 "ballista.shuffle.pipelined.enabled=true is unavailable in this build; \
@@ -1493,21 +1491,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                                 // graph transition and prepared metadata
                                 // commit, so generation/version cannot change
                                 // between validation and visibility.
-                                running_stage.apply_task_info(
-                                    task_id,
-                                    task_status_for_update,
-                                );
-                                running_stage.apply_prepared_task_metrics(
-                                    prepared_metrics,
-                                );
-                                running_stage.append_runtime_stats_reports(
-                                    task_id,
-                                    runtime_stats,
-                                );
-                                running_stage.append_window_state_reports(
-                                    task_id,
-                                    window_state,
-                                );
+                                running_stage
+                                    .apply_task_info(task_id, task_status_for_update);
+                                running_stage
+                                    .apply_prepared_task_metrics(prepared_metrics);
+                                running_stage
+                                    .append_runtime_stats_reports(task_id, runtime_stats);
+                                running_stage
+                                    .append_window_state_reports(task_id, window_state);
                                 registry.commit_prepared(prepared_commit);
                             } else {
                                 // Feature off (or deliberately ineffective,
@@ -1515,22 +1506,17 @@ impl ExecutionGraph for StaticExecutionGraph {
                                 // pre-pipelining status/metrics/report ordering
                                 // and behavior without touching the new
                                 // registry mutex.
-                                if !running_stage.update_task_info(
-                                    task_id,
-                                    task_status_for_update,
-                                ) {
+                                if !running_stage
+                                    .update_task_info(task_id, task_status_for_update)
+                                {
                                     continue;
                                 }
                                 running_stage
                                     .update_task_metrics(task_id, operator_metrics)?;
-                                running_stage.append_runtime_stats_reports(
-                                    task_id,
-                                    runtime_stats,
-                                );
-                                running_stage.append_window_state_reports(
-                                    task_id,
-                                    window_state,
-                                );
+                                running_stage
+                                    .append_runtime_stats_reports(task_id, runtime_stats);
+                                running_stage
+                                    .append_window_state_reports(task_id, window_state);
                             }
                             locations.append(&mut committed);
                         } else {
@@ -2025,11 +2011,8 @@ impl ExecutionGraph for StaticExecutionGraph {
                 // task_infos is append-only across attempts. A restored prefix
                 // belongs to older attempts and exists only to reserve task IDs;
                 // never manufacture (new_attempt, old_task_id) refund identities.
-                let current_attempt_start = self
-                    .retired_tasks
-                    .get(&stage_id)
-                    .map(Vec::len)
-                    .unwrap_or(0);
+                let current_attempt_start =
+                    self.retired_tasks.get(&stage_id).map(Vec::len).unwrap_or(0);
                 let mut retired = stage.task_infos.clone();
                 for (task, info) in retired.iter_mut().enumerate() {
                     if task >= current_attempt_start {
@@ -2509,10 +2492,10 @@ mod test {
     use std::sync::Arc;
 
     use crate::scheduler_server::event::QueryStageSchedulerEvent;
-    use ballista_core::error::{BallistaError, Result};
-    use ballista_core::extension::SessionConfigExt;
-    use ballista_core::execution_plans::UnresolvedShuffleExec;
     use ballista_core::JobId;
+    use ballista_core::error::{BallistaError, Result};
+    use ballista_core::execution_plans::UnresolvedShuffleExec;
+    use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::protobuf::{
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status, task_status,
@@ -2536,7 +2519,6 @@ mod test {
         test_aggregation_plan_with_config, test_coalesce_plan, test_join_plan,
         test_two_aggregations_plan, test_union_all_plan, test_union_plan,
     };
-
 
     async fn pipelined_fresh_graph() -> super::StaticExecutionGraph {
         let mut graph = test_two_aggregations_plan(4).await;
@@ -2607,7 +2589,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn pipelined_repeated_rollbacks_preserve_task_ids_and_refund_once() -> Result<()> {
+    async fn pipelined_repeated_rollbacks_preserve_task_ids_and_refund_once() -> Result<()>
+    {
         let mut graph = pipelined_test_graph().await;
 
         let first = graph.pop_next_task("attempt-0")?.unwrap();
@@ -2642,11 +2625,11 @@ mod test {
         let mut impossible_identity = first_status.clone();
         impossible_identity.stage_attempt_num = second_attempt as u32;
         assert_eq!(graph.release_task_vcores(&impossible_identity), 0);
-        assert!(
-            !graph
-                .retired_vcores
-                .contains_key(&(stage_id, second_attempt, first_task_id))
-        );
+        assert!(!graph.retired_vcores.contains_key(&(
+            stage_id,
+            second_attempt,
+            first_task_id
+        )));
 
         graph.resolve_stage(stage_id)?;
         graph.revive();
@@ -2658,7 +2641,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn pipelined_stale_deferred_success_after_executor_loss_is_ignored() -> Result<()> {
+    async fn pipelined_stale_deferred_success_after_executor_loss_is_ignored()
+    -> Result<()> {
         let mut graph = pipelined_test_graph().await;
         let producer_executor = mock_executor("producer".into());
         let first = graph.pop_next_task(&producer_executor.id)?.unwrap();
@@ -2686,9 +2670,7 @@ mod test {
 
         graph.reset_stages_on_lost_executor(&consumer_executor.id)?;
         assert!(matches!(
-            &graph.stages[&consumer_stage_id]
-                .task_infos()
-                .unwrap()[consumer_task_id]
+            &graph.stages[&consumer_stage_id].task_infos().unwrap()[consumer_task_id]
                 .task_status,
             task_status::Status::Failed(FailedTask {
                 failed_reason: Some(failed_task::FailedReason::ResultLost(_)),
@@ -2716,12 +2698,7 @@ mod test {
 
         // A duplicate terminal report from the retired executor after seal is
         // equally stale and must remain harmless.
-        graph.update_task_status(
-            &consumer_executor,
-            vec![stale_success],
-            4,
-            4,
-        )?;
+        graph.update_task_status(&consumer_executor, vec![stale_success], 4, 4)?;
         assert!(
             !graph
                 .shuffle_inputs
@@ -2753,7 +2730,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn pipelined_tail_waits_for_assignment_and_holds_short_circuit_success() -> Result<()> {
+    async fn pipelined_tail_waits_for_assignment_and_holds_short_circuit_success()
+    -> Result<()> {
         let mut graph = pipelined_test_graph().await;
         let executor = mock_executor("producer".into());
         let first = graph.pop_next_task(&executor.id)?.unwrap();
@@ -3177,9 +3155,7 @@ mod test {
             ("range-writer", false, false, false, true, false),
         ];
 
-        for (name, broadcast, coalesced, range_reader, range_writer, expected) in
-            cases
-        {
+        for (name, broadcast, coalesced, range_reader, range_writer, expected) in cases {
             assert_eq!(
                 super::pipelined_shape_eligible(
                     broadcast,
@@ -3204,10 +3180,8 @@ mod test {
         let broadcast: Arc<dyn ExecutionPlan> =
             Arc::new(UnresolvedShuffleExec::new_broadcast(2, schema, 2));
 
-        let all_static = EligibilityChildrenExec::new(vec![
-            eligible.clone(),
-            eligible.clone(),
-        ]);
+        let all_static =
+            EligibilityChildrenExec::new(vec![eligible.clone(), eligible.clone()]);
         assert!(super::pipelined_plan_eligible(&all_static));
 
         let mixed = EligibilityChildrenExec::new(vec![eligible, broadcast]);
@@ -3222,8 +3196,7 @@ mod test {
                 .with_ballista_adaptive_query_planner(false),
         );
         let job = JobId::from("pipelined-final-barrier");
-        let graph =
-            test_aggregation_plan_with_config(2, &job, config).await;
+        let graph = test_aggregation_plan_with_config(2, &job, config).await;
 
         let final_stage = graph
             .stages
@@ -3246,8 +3219,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_failed_shuffle_publication_does_not_accept_task_success()
-    -> Result<()> {
+    async fn test_failed_shuffle_publication_does_not_accept_task_success() -> Result<()>
+    {
         let config = Arc::new(
             SessionConfig::new_with_ballista()
                 .with_ballista_shuffle_pipelined_enabled(true)
@@ -3255,8 +3228,7 @@ mod test {
         );
         let job_id = JobId::from("pipelined-rejected-publication");
         let executor = mock_executor("executor-id1".to_string());
-        let mut graph =
-            test_aggregation_plan_with_config(2, &job_id, config).await;
+        let mut graph = test_aggregation_plan_with_config(2, &job_id, config).await;
         graph.revive();
 
         let task = graph
@@ -3319,8 +3291,7 @@ mod test {
                 .with_ballista_adaptive_query_planner(false),
         );
         let job = JobId::from("pipelined-replay");
-        let mut graph =
-            test_aggregation_plan_with_config(2, &job, config).await;
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
         graph.revive();
 
         let executor = mock_executor("executor-id1".to_string());
@@ -3366,8 +3337,7 @@ mod test {
                 .with_ballista_adaptive_query_planner(false),
         );
         let job = JobId::from("pipelined-stale-attempt");
-        let mut graph =
-            test_aggregation_plan_with_config(2, &job, config).await;
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
         graph.revive();
 
         let executor = mock_executor("executor-id1".to_string());
@@ -3378,10 +3348,8 @@ mod test {
         let task_id = task.key.task_id;
         let mut status = mock_completed_task(task, &executor.id);
 
-        let ExecutionStage::Running(stage) = graph
-            .stages
-            .get_mut(&stage_id)
-            .expect("running stage")
+        let ExecutionStage::Running(stage) =
+            graph.stages.get_mut(&stage_id).expect("running stage")
         else {
             panic!("expected running stage");
         };
@@ -3395,10 +3363,8 @@ mod test {
         status.stage_attempt_num = (status.stage_attempt_num + 2) as u32;
         graph.update_task_status(&executor, vec![status], 1, 1)?;
 
-        let ExecutionStage::Running(stage) = graph
-            .stages
-            .get(&stage_id)
-            .expect("running stage")
+        let ExecutionStage::Running(stage) =
+            graph.stages.get(&stage_id).expect("running stage")
         else {
             panic!("stale status must not transition the stage");
         };
@@ -3428,8 +3394,7 @@ mod test {
                 .with_ballista_adaptive_query_planner(false),
         );
         let job = JobId::from("pipelined-rollover-survivor");
-        let mut graph =
-            test_aggregation_plan_with_config(2, &job, config).await;
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
         graph.revive();
 
         let executor = mock_executor("executor-id1".to_string());
@@ -3471,8 +3436,7 @@ mod test {
                 .with_ballista_adaptive_query_planner(false),
         );
         let job = JobId::from("pipelined-missing-registry");
-        let mut graph =
-            test_aggregation_plan_with_config(2, &job, config).await;
+        let mut graph = test_aggregation_plan_with_config(2, &job, config).await;
         graph.revive();
 
         let executor = mock_executor("executor-id1".to_string());
@@ -3488,7 +3452,11 @@ mod test {
         let error = graph
             .update_task_status(&executor, vec![task_status], 1, 1)
             .expect_err("missing active registry state must fail closed");
-        assert!(error.to_string().contains("pipelined shuffle input missing"));
+        assert!(
+            error
+                .to_string()
+                .contains("pipelined shuffle input missing")
+        );
 
         let ExecutionStage::Running(stage) = graph
             .stages
@@ -3506,8 +3474,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_pipelining_disabled_does_not_initialize_shuffle_registry()
-    -> Result<()> {
+    async fn test_pipelining_disabled_does_not_initialize_shuffle_registry() -> Result<()>
+    {
         let graph = test_aggregation_plan(2).await;
         let registry = graph.shuffle_inputs.lock();
         for stage_id in graph.stages.keys() {
