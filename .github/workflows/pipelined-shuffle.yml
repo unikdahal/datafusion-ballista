@@ -71,7 +71,9 @@ jobs:
           ARROW_TEST_DATA: ${{ github.workspace }}/testing/data
           PARQUET_TEST_DATA: ${{ github.workspace }}/parquet-testing/data
       - name: Check executor integration
-        run: cargo check --locked -p ballista-executor --all-targets
+        run: |
+          cargo check --locked -p ballista-executor --all-targets
+          cargo test --locked -p ballista-executor --lib executor_server::test
       - name: End-to-end local and Flight equivalence
         if: hashFiles('ballista/client/tests/pipelined_shuffle.rs') != ''
         run: cargo test --locked -p ballista --test pipelined_shuffle
