@@ -1264,9 +1264,13 @@ impl ExecutionGraph for StaticExecutionGraph {
         let mut successful_stages = HashSet::new();
         let mut failed_stages = HashMap::new();
         let mut rollback_running_stages = HashMap::new();
-        let mut resubmit_successful_stages: HashMap<usize, HashSet<usize>> =
+        // Producer task ids whose already-published shuffle output was found
+        // unreadable by a downstream fetch. The producer may still be Running
+        // under pipelined execution, or it may already be Successful under the
+        // traditional barrier path; defer the state-specific transition until
+        // all reports in this batch have been applied.
+        let mut lost_materialized_tasks: HashMap<usize, HashSet<usize>> =
             HashMap::new();
-        let mut reset_running_stages: HashMap<usize, HashSet<usize>> = HashMap::new();
 
         for (stage_id, stage_task_statuses) in job_task_statuses {
             if let Some(stage) = self.stages.get_mut(&stage_id) {
@@ -1381,11 +1385,11 @@ impl ExecutionGraph for StaticExecutionGraph {
                                                 .or_insert_with(HashSet::new);
                                             failure_reasons.insert(executor_id);
 
-                                            let missing_inputs =
-                                                resubmit_successful_stages
+                                            let lost_tasks =
+                                                lost_materialized_tasks
                                                     .entry(map_stage_id)
                                                     .or_default();
-                                            missing_inputs.extend(removed_map_partitions);
+                                            lost_tasks.extend(removed_map_partitions);
                                             warn!(
                                                 "Need to resubmit the current running Stage {stage_id} and its map Stage {map_stage_id} due to FetchPartitionError from task {task_identity}"
                                             )
@@ -1554,7 +1558,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     }
 
                     let is_final_successful = running_stage.is_successful()
-                        && !reset_running_stages.contains_key(&stage_id);
+                        && !lost_materialized_tasks.contains_key(&stage_id);
                     if is_final_successful {
                         if pipelining_enabled {
                             let mut registry = self.shuffle_inputs.lock();
@@ -1645,10 +1649,10 @@ impl ExecutionGraph for StaticExecutionGraph {
                                             &executor_id,
                                         )?;
 
-                                    let missing_inputs = reset_running_stages
+                                    let lost_tasks = lost_materialized_tasks
                                         .entry(map_stage_id)
                                         .or_default();
-                                    missing_inputs.extend(removed_map_partitions);
+                                    lost_tasks.extend(removed_map_partitions);
                                     warn!(
                                         "Need to reset the current running Stage {map_stage_id} due to late come FetchPartitionError from its parent stage {stage_id} of task {task_identity}"
                                     );
@@ -1694,23 +1698,51 @@ impl ExecutionGraph for StaticExecutionGraph {
                 .insert(*stage_id, HashSet::from_iter(attempts.iter().copied()));
         }
 
-        // The values in `resubmit_successful_stages` and `reset_running_stages`
-        // come out of `remove_input_partitions` collecting
-        // `loc.map_partition_id`, which under the multi-partition-task model
-        // is the source task's `task_id` (see `partition_to_location`).
-        // So the set members are task_ids (append slots), not partition ids —
-        // bounds check against `task_infos.len()` and pass through to
-        // `reset_task_info` / `task_infos[...]` directly.
+        // `remove_input_partitions` returns `loc.map_partition_id`, which
+        // under the append-only multi-partition task model is the producing
+        // task's task_id. A pipelined consumer can report a fetch failure while
+        // that producer stage is still Running, so handle both producer states:
         //
-        // TODO: switch to partition-id semantics — push only the actually-lost
-        // partition_ids back into `stage.pending`, avoiding the "redo the
-        // whole map task's slice" waste on partial-loss scenarios. Needs
-        // `remove_input_partitions` to expose partition_ids (from the outer
-        // map key) and a way to partial-reset a still-Running task.
-        for (stage_id, missing_task_ids) in &resubmit_successful_stages {
-            if let Some(stage) = self.stages.get_mut(stage_id) {
-                if let ExecutionStage::Successful(success_stage) = stage {
-                    for task_id in missing_task_ids {
+        // * Running: retire the successful task in-place as ResultLost and put
+        //   its whole input slice back in pending. Registry reconciliation then
+        //   notices that an accepted publication disappeared and rolls the
+        //   generation forward.
+        // * Successful: mark the task ResultLost and use the existing
+        //   Successful -> Running resubmission transition.
+        //
+        // Resetting the whole task slice is conservative but correct when one
+        // artifact from a multi-partition task is lost.
+        let mut successful_resubmits = HashSet::new();
+        for (stage_id, lost_task_ids) in &lost_materialized_tasks {
+            let Some(stage) = self.stages.get_mut(stage_id) else {
+                return Err(BallistaError::Internal(format!(
+                    "Invalid stage ID {stage_id} for job {job_id}"
+                )));
+            };
+
+            match stage {
+                ExecutionStage::Running(running_stage) => {
+                    for task_id in lost_task_ids {
+                        if *task_id >= running_stage.task_infos.len() {
+                            return Err(BallistaError::Internal(format!(
+                                "Invalid task_id {} in map stage {} (task_infos has {} entries)",
+                                *task_id,
+                                stage_id,
+                                running_stage.task_infos.len()
+                            )));
+                        }
+                        running_stage.mark_materialized_result_lost(
+                            *task_id,
+                            "FetchPartitionError in downstream stage",
+                        );
+                    }
+                    // A producer may have been provisionally classified as
+                    // successful earlier in this same status batch. Result
+                    // loss wins and keeps it Running.
+                    successful_stages.remove(stage_id);
+                }
+                ExecutionStage::Successful(success_stage) => {
+                    for task_id in lost_task_ids {
                         if *task_id >= success_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
                                 "Invalid task_id {} in map stage {} (task_infos has {} entries)",
@@ -1720,49 +1752,38 @@ impl ExecutionGraph for StaticExecutionGraph {
                             )));
                         }
                         let task_info = &mut success_stage.task_infos[*task_id];
-                        // Update the task info to failed
-                        task_info.task_status = task_status::Status::Failed(FailedTask {
-                            error: "FetchPartitionError in parent stage".to_owned(),
-                            retryable: true,
-                            count_to_failures: false,
-                            failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
-                        });
-                    }
-                } else {
-                    warn!(
-                        "Stage {job_id}/{stage_id} is not in Successful state when try to resubmit this stage. "
-                    );
-                }
-            } else {
-                return Err(BallistaError::Internal(format!(
-                    "Invalid stage ID {stage_id} for job {job_id}"
-                )));
-            }
-        }
-
-        for (stage_id, missing_task_ids) in &reset_running_stages {
-            if let Some(stage) = self.stages.get_mut(stage_id) {
-                if let ExecutionStage::Running(running_stage) = stage {
-                    for task_id in missing_task_ids {
-                        if *task_id >= running_stage.task_infos.len() {
-                            return Err(BallistaError::Internal(format!(
-                                "Invalid task_id {} in map stage {} (task_infos has {} entries)",
-                                *task_id,
-                                stage_id,
-                                running_stage.task_infos.len()
-                            )));
+                        if matches!(
+                            task_info.task_status,
+                            task_status::Status::Successful(_)
+                        ) {
+                            task_info.task_status =
+                                task_status::Status::Failed(FailedTask {
+                                    error:
+                                        "FetchPartitionError in downstream stage"
+                                            .to_owned(),
+                                    retryable: true,
+                                    count_to_failures: false,
+                                    failed_reason: Some(FailedReason::ResultLost(
+                                        ResultLost {},
+                                    )),
+                                });
                         }
-                        running_stage.reset_task_info(*task_id);
                     }
-                } else {
+                    successful_resubmits.insert(*stage_id);
+                }
+                _ => {
                     warn!(
-                        "Stage {job_id}/{stage_id} is not in Running state when try to reset the running task. "
+                        "Ignoring materialized-result loss for non-running/non-successful stage {job_id}/{stage_id}"
                     );
                 }
-            } else {
-                return Err(BallistaError::Internal(format!(
-                    "Invalid stage ID {stage_id} for job {job_id}"
-                )));
+            }
+
+            // If this producer was sealed earlier in the same batch, any
+            // dependent stage that was tentatively marked resolvable must not
+            // cross the barrier using the now-lost output.
+            let output_links = stage.output_links().to_vec();
+            for output_stage_id in output_links {
+                resolved_stages.remove(&output_stage_id);
             }
         }
 
@@ -1771,10 +1792,7 @@ impl ExecutionGraph for StaticExecutionGraph {
             successful_stages,
             failed_stages,
             rollback_running_stages,
-            resubmit_successful_stages: resubmit_successful_stages
-                .keys()
-                .cloned()
-                .collect(),
+            resubmit_successful_stages: successful_resubmits,
         })?;
         let deferred = std::mem::take(&mut self.deferred_successes);
         let mut ready = vec![];
@@ -2965,6 +2983,104 @@ mod test {
                 .stage_id,
             producer
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipelined_fetch_failure_retires_output_from_running_producer()
+    -> Result<()> {
+        let mut graph = pipelined_test_graph().await;
+        let producer_executor = mock_executor("producer-with-lost-output".into());
+
+        let first = graph.pop_next_task(&producer_executor.id)?.unwrap();
+        let producer_stage = first.key.stage_id;
+        let first_task_id = first.key.task_id;
+        graph.update_task_status(
+            &producer_executor,
+            vec![mock_completed_task(first, &producer_executor.id)],
+            4,
+            4,
+        )?;
+
+        // Assign the producer tail without completing it. The producer stage
+        // therefore remains Running while downstream consumes the first task's
+        // committed output.
+        let _straggler = graph.pop_next_task("producer-straggler")?.unwrap();
+        let consumer_executor = mock_executor("consumer".into());
+        let consumer = bind_tail(&mut graph, &consumer_executor.id);
+        let consumer_stage = consumer.key.stage_id;
+
+        let (lost_executor, lost_output_partition) = {
+            let output = graph
+                .shuffle_inputs
+                .lock()
+                .stage_output(&graph.job_id, producer_stage)
+                .expect("published producer output");
+            let location = output
+                .partition_locations
+                .values()
+                .flat_map(|locations| locations.iter())
+                .find(|location| location.map_partition_id == first_task_id)
+                .expect("first producer task must have a committed block");
+            (
+                location.executor_meta.id.clone(),
+                location.partition_id.partition_id,
+            )
+        };
+
+        let events = graph.update_task_status(
+            &consumer_executor,
+            vec![mock_failed_task(
+                consumer,
+                wrapped_fetch_failed_task(
+                    &lost_executor,
+                    producer_stage,
+                    lost_output_partition,
+                ),
+            )],
+            4,
+            4,
+        )?;
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                QueryStageSchedulerEvent::CancelTasks(tasks)
+                    if tasks.iter().any(|task| task.stage_id == consumer_stage)
+            )),
+            "the generation-pinned consumer must be cancelled"
+        );
+
+        let ExecutionStage::Running(producer) = &graph.stages[&producer_stage] else {
+            panic!("producer must remain Running and retry the lost task");
+        };
+        assert!(matches!(
+            producer.task_infos[first_task_id].task_status,
+            task_status::Status::Failed(FailedTask {
+                failed_reason: Some(failed_task::FailedReason::ResultLost(_)),
+                ..
+            })
+        ));
+        assert!(
+            producer
+                .pending
+                .remaining()
+                >= producer.task_infos[first_task_id]
+                    .global_input_partition_ids
+                    .len(),
+            "the lost producer slice must be returned to pending"
+        );
+        assert_eq!(
+            graph
+                .shuffle_inputs
+                .lock()
+                .get(&graph.job_id, producer_stage)
+                .unwrap()
+                .generation(),
+            2,
+            "dropping an accepted publication must roll the generation"
+        );
+
         Ok(())
     }
 
