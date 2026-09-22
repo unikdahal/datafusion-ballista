@@ -1200,7 +1200,11 @@ async fn run_coordinator(
                     total_rows,
                 );
                 for (part_id, num_batches, num_rows, num_bytes) in partition_stats {
-                    if num_rows > 0 && part_id < k {
+                    if part_id < k {
+                        // Completion reports are also the authoritative output
+                        // manifest used by the scheduler. Keep zero-row buckets
+                        // in the report so a missing non-empty bucket cannot be
+                        // mistaken for a legitimately empty one.
                         grouped[part_id].push(ShuffleWritePartition {
                             partition_id: part_id as u64,
                             num_batches,
@@ -2163,12 +2167,24 @@ mod tests {
             SortShuffleConfig::default(),
         )?;
 
-        let mut stream = writer.execute(0, task_ctx)?;
-        let _summary: Vec<RecordBatch> = stream
-            .by_ref()
-            .try_collect()
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+        let mut summary_streams = Vec::with_capacity(num_partitions);
+        for partition_id in 0..num_partitions {
+            summary_streams.push(writer.execute(partition_id, task_ctx.clone())?);
+        }
+        let mut summary_rows = Vec::with_capacity(num_partitions);
+        for mut stream in summary_streams {
+            let summary: Vec<RecordBatch> = stream
+                .by_ref()
+                .try_collect()
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+            summary_rows.push(summary.iter().map(RecordBatch::num_rows).sum::<usize>());
+        }
+        assert_eq!(
+            summary_rows,
+            vec![1; num_partitions],
+            "every sort bucket, including empty buckets, must appear in the completion manifest"
+        );
 
         let data_path = work_dir
             .path()

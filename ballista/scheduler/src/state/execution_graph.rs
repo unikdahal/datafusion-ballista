@@ -1801,6 +1801,11 @@ pub(crate) fn partition_to_location(
 ) -> Vec<PartitionLocation> {
     shuffles
         .into_iter()
+        // Sort writers report every output bucket so the scheduler can validate
+        // a complete task manifest. Preserve the existing sparse StageOutput
+        // compatibility view by dropping zero-row sort buckets; passthrough and
+        // range zero-row outputs remain explicit locations.
+        .filter(|shuffle| !shuffle.is_sort_shuffle || shuffle.num_rows > 0)
         .map(|shuffle| PartitionLocation {
             map_partition_id,
             partition_id: PartitionId {
@@ -1840,7 +1845,7 @@ mod test {
         SendableRecordBatchStream,
     };
 
-    use crate::state::execution_graph::ExecutionGraph;
+    use crate::state::execution_graph::{ExecutionGraph, partition_to_location};
     use crate::state::execution_stage::ExecutionStage;
     use crate::test_utils::{
         mock_completed_task, mock_executor, mock_failed_task,
@@ -1849,6 +1854,50 @@ mod test {
         test_coalesce_plan, test_join_plan, test_two_aggregations_plan,
         test_union_all_plan, test_union_plan,
     };
+
+    #[test]
+    fn partition_to_location_keeps_sort_manifest_entries_out_of_sparse_stage_output() {
+        let job_id = "job".into();
+        let executor = mock_executor("executor-1".to_owned());
+        let locations = partition_to_location(
+            &job_id,
+            4,
+            7,
+            &executor,
+            vec![
+                protobuf::ShuffleWritePartition {
+                    partition_id: 0,
+                    num_batches: 1,
+                    num_rows: 10,
+                    num_bytes: 100,
+                    file_id: Some(4),
+                    is_sort_shuffle: true,
+                },
+                protobuf::ShuffleWritePartition {
+                    partition_id: 1,
+                    num_batches: 0,
+                    num_rows: 0,
+                    num_bytes: 0,
+                    file_id: Some(4),
+                    is_sort_shuffle: true,
+                },
+                protobuf::ShuffleWritePartition {
+                    partition_id: 2,
+                    num_batches: 0,
+                    num_rows: 0,
+                    num_bytes: 0,
+                    file_id: Some(4),
+                    is_sort_shuffle: false,
+                },
+            ],
+        );
+
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].partition_id.partition_id, 0);
+        assert_eq!(locations[1].partition_id.partition_id, 2);
+        assert!(locations[0].is_sort_shuffle);
+        assert!(!locations[1].is_sort_shuffle);
+    }
 
     #[derive(Debug)]
     struct FailingPlanRewriteExec {
