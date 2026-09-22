@@ -219,17 +219,16 @@ impl ShuffleInputRegistry {
 
         if let Some(previous_keys) = state.accepted_tasks.get(&task) {
             let exact_replay = previous_keys.len() == publication.len()
-                && previous_keys
-                    .iter()
-                    .zip(publication.iter())
-                    .all(|(previous_key, location)| {
+                && previous_keys.iter().zip(publication.iter()).all(
+                    |(previous_key, location)| {
                         let key = ShuffleBlockKey::from(location);
                         previous_key == &key
                             && state
                                 .blocks
                                 .get(previous_key)
                                 .is_some_and(|block| block.location == *location)
-                    });
+                    },
+                );
             if exact_replay {
                 return Ok(PreparedShuffleCommit {
                     job: job.clone(),
@@ -321,9 +320,7 @@ impl ShuffleInputRegistry {
                 .push((prepared.version, key));
             publication_keys.push(key);
         }
-        state
-            .accepted_tasks
-            .insert(prepared.task, publication_keys);
+        state.accepted_tasks.insert(prepared.task, publication_keys);
         state.version = prepared.version;
         state.notify.notify_waiters();
         state.version
@@ -748,8 +745,7 @@ mod tests {
         assert_eq!(state.partition_index[&1].len(), 2);
         assert_eq!(state.partition_index[&2].len(), 2);
 
-        let ShuffleInputRead::Update(snapshot) =
-            registry.read(&job, 1, 1, 1, &[1])?
+        let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 1, 1, &[1])?
         else {
             panic!()
         };
@@ -757,10 +753,7 @@ mod tests {
         assert_eq!(snapshot.locations.len(), 1);
         assert_eq!(snapshot.locations[0].published_version, 2);
         assert_eq!(snapshot.locations[0].location.map_partition_id, 1);
-        assert_eq!(
-            snapshot.locations[0].location.partition_id.partition_id,
-            1
-        );
+        assert_eq!(snapshot.locations[0].location.partition_id.partition_id, 1);
 
         Ok(())
     }
