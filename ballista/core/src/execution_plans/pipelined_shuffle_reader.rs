@@ -808,4 +808,3 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
         )))
     }
 }
-
