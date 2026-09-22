@@ -3039,13 +3039,23 @@ mod test {
             4,
         )?;
 
+        // The task reporting FetchPartitionError is already terminal, so there
+        // is nothing to send back to its executor as a cancellation. What must
+        // happen is that the whole generation-pinned consumer stage is revoked;
+        // any still-running sibling tasks would be returned in CancelTasks.
         assert!(
-            events.iter().any(|event| matches!(
+            !events.iter().any(|event| matches!(
                 event,
-                QueryStageSchedulerEvent::CancelTasks(tasks)
-                    if tasks.iter().any(|task| task.stage_id == consumer_stage)
+                QueryStageSchedulerEvent::JobRunningFailed { .. }
             )),
-            "the generation-pinned consumer must be cancelled"
+            "materialized result loss is recoverable"
+        );
+        assert!(
+            matches!(
+                graph.stages.get(&consumer_stage),
+                Some(ExecutionStage::UnResolved(_))
+            ),
+            "the generation-pinned consumer attempt must be rolled back"
         );
 
         let ExecutionStage::Running(producer) = &graph.stages[&producer_stage] else {
