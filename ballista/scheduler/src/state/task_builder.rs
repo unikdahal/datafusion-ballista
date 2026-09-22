@@ -288,11 +288,12 @@ fn validate_partition_indices(
 /// buckets of Hash(exprs, 2), and a permutation such as [6, 2] is not
 /// Hash(exprs, 8) either. The physical mapping is retained by the leaf itself;
 /// the property exposed to downstream operators must therefore be conservative.
-fn projected_partitioning(partitioning: &Partitioning, indices: &[usize]) -> Partitioning {
+fn projected_partitioning(
+    partitioning: &Partitioning,
+    indices: &[usize],
+) -> Partitioning {
     let original_count = partitioning.partition_count();
-    if indices.len() == original_count
-        && indices.iter().copied().eq(0..original_count)
-    {
+    if indices.len() == original_count && indices.iter().copied().eq(0..original_count) {
         partitioning.clone()
     } else {
         Partitioning::UnknownPartitioning(indices.len())
@@ -421,10 +422,7 @@ fn select_output_partitions(
                     bounds.len(),
                     "RangeShuffleReaderExec bounds",
                 )?;
-                let kept = indices
-                    .iter()
-                    .map(|&p| bounds[p].clone())
-                    .collect();
+                let kept = indices.iter().map(|&p| bounds[p].clone()).collect();
                 let Ok(restricted) = restricted.with_bounds(kept) else {
                     return Ok(None);
                 };
@@ -526,11 +524,7 @@ mod tests {
                     generation: 7,
                 },
                 (0..8).collect(),
-                Arc::new(Schema::new(vec![Field::new(
-                    "a",
-                    DataType::Int32,
-                    false,
-                )])),
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
                 partitioning,
             )
             .unwrap(),
@@ -564,7 +558,8 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_reader_downgrades_round_robin_and_preserves_identity_slice() -> Result<()> {
+    fn pipelined_reader_downgrades_round_robin_and_preserves_identity_slice() -> Result<()>
+    {
         let reader = pipelined_reader(Partitioning::RoundRobinBatch(8));
         let restricted = restrict_plan_to_partitions(reader, &[1, 5])?;
         let sliced = restricted
@@ -587,7 +582,8 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_reader_preserves_requested_order_and_rejects_bad_indices() -> Result<()> {
+    fn pipelined_reader_preserves_requested_order_and_rejects_bad_indices() -> Result<()>
+    {
         let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
         let restricted = restrict_plan_to_partitions(reader, &[6, 2])?;
         let sliced = restricted
@@ -616,7 +612,10 @@ mod tests {
         let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
         let restricted = restrict_plan_to_partitions(reader, &[])?;
         assert_eq!(
-            restricted.properties().output_partitioning().partition_count(),
+            restricted
+                .properties()
+                .output_partitioning()
+                .partition_count(),
             0
         );
         assert!(restricted.downcast_ref::<DataSourceExec>().is_some());
@@ -625,7 +624,8 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn collect_scope_remains_sticky_through_partition_preserving_operator() -> Result<()> {
+    fn collect_scope_remains_sticky_through_partition_preserving_operator() -> Result<()>
+    {
         use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 
         let reader = pipelined_reader(Partitioning::UnknownPartitioning(8));
@@ -717,10 +717,12 @@ mod tests {
 
     #[test]
     fn blocking_reader_rejects_duplicate_and_out_of_range_indices() {
-        let duplicate = restrict_plan_to_partitions(shuffle_reader(4), &[1, 1]).unwrap_err();
+        let duplicate =
+            restrict_plan_to_partitions(shuffle_reader(4), &[1, 1]).unwrap_err();
         assert!(duplicate.to_string().contains("selected more than once"));
 
-        let out_of_bounds = restrict_plan_to_partitions(shuffle_reader(4), &[4]).unwrap_err();
+        let out_of_bounds =
+            restrict_plan_to_partitions(shuffle_reader(4), &[4]).unwrap_err();
         assert!(out_of_bounds.to_string().contains("out of bounds"));
     }
 
@@ -892,11 +894,8 @@ mod tests {
     #[test]
     fn union_rejects_duplicate_and_out_of_range_parent_partitions() {
         let make_union = || -> Arc<dyn ExecutionPlan> {
-            UnionExec::try_new(vec![
-                scan_with_file_groups(2),
-                scan_with_file_groups(2),
-            ])
-            .unwrap()
+            UnionExec::try_new(vec![scan_with_file_groups(2), scan_with_file_groups(2)])
+                .unwrap()
         };
 
         let duplicate = restrict_plan_to_partitions(make_union(), &[1, 1]).unwrap_err();
