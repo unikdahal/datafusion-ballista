@@ -21,7 +21,7 @@
 //! and StageOutput. Later integration should derive those compatibility views
 //! from this state rather than maintain another independently mutable copy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -43,12 +43,18 @@ pub(crate) struct ShuffleArtifactKey {
 }
 
 impl ShuffleArtifactKey {
-    fn from_location(location: &PartitionLocation) -> Self {
+    /// Creates the canonical key for one materialized shuffle artifact.
+    pub(crate) fn from_location(location: &PartitionLocation) -> Self {
         Self {
             producer_task_id: location.map_partition_id,
             output_partition_id: location.partition_id.partition_id,
             file_id: location.file_id,
         }
+    }
+
+    /// Returns the producer task that owns this artifact.
+    pub(crate) fn producer_task_id(self) -> usize {
+        self.producer_task_id
     }
 }
 
@@ -97,6 +103,35 @@ pub(crate) enum ShufflePublicationResult {
     Replay,
 }
 
+/// Description of one successful exchange-epoch rollover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShuffleEpochRollover {
+    /// Epoch that was invalidated.
+    pub(crate) previous_epoch: ShuffleExchangeEpoch,
+    /// Fresh epoch containing only surviving producer output.
+    pub(crate) current_epoch: ShuffleExchangeEpoch,
+    /// Reader-visible bootstrap event containing every surviving artifact.
+    ///
+    /// This is None when no materialized artifacts survive. Accepted empty task
+    /// publications can still survive without creating a reader-visible event.
+    pub(crate) bootstrap_cursor: Option<ShuffleExchangeCursor>,
+    /// Accepted producer tasks removed by this rollover, in deterministic order.
+    pub(crate) invalidated_tasks: Vec<usize>,
+    /// Number of accepted producer tasks retained in the new epoch.
+    pub(crate) retained_task_count: usize,
+    /// Number of materialized artifacts retained in the new epoch.
+    pub(crate) retained_artifact_count: usize,
+}
+
+/// Result of applying an output-loss signal to an exchange.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShuffleInvalidationResult {
+    /// No currently accepted producer output matched the loss signal.
+    Unchanged,
+    /// At least one accepted producer task was invalidated and the epoch rolled.
+    Rolled(ShuffleEpochRollover),
+}
+
 /// Structural exchange-state error.
 ///
 /// These variants are intentionally specific so later scheduler integration can
@@ -130,6 +165,8 @@ pub(crate) enum ShuffleExchangeError {
         after: ShuffleExchangeCursor,
         current: ShuffleExchangeCursor,
     },
+    /// The exchange epoch cannot advance without wrapping.
+    EpochExhausted,
     /// The event sequence cannot advance without wrapping.
     SequenceExhausted,
 }
@@ -173,6 +210,7 @@ impl Display for ShuffleExchangeError {
                 current.epoch().get(),
                 current.sequence().get()
             ),
+            Self::EpochExhausted => f.write_str("shuffle exchange epoch exhausted"),
             Self::SequenceExhausted => f.write_str("shuffle exchange sequence exhausted"),
         }
     }
@@ -188,8 +226,8 @@ type Result<T> = std::result::Result<T, ShuffleExchangeError>;
 /// atomic mutation boundary: either every artifact in the report becomes visible
 /// at one event sequence, or the exchange remains unchanged.
 ///
-/// This PR models only the first epoch. Epoch rollover is intentionally added by
-/// the recovery follow-up so invalidation semantics stay independently reviewable.
+/// Epoch rollover preserves usable producer output while invalidating every
+/// reader pinned to the retired materialized history.
 #[derive(Debug)]
 pub(crate) struct ShuffleExchangeState {
     id: ShuffleExchangeId,
@@ -202,9 +240,11 @@ pub(crate) struct ShuffleExchangeState {
     // Producer task -> canonical artifact keys. Empty output is represented by
     // an empty vector, which is still an accepted task publication.
     //
-    // Producer task IDs are unique within an epoch. Any recovery transition
-    // that can reset or reuse the task-ID namespace must roll the exchange
-    // epoch before accepting replacement publications.
+    // Producer task IDs identify scheduler task attempts. Accepted publications
+    // for surviving tasks are retained across epoch rollover; invalidated task
+    // publications are removed. Tasks that had not materialized output in the
+    // retired epoch may still commit into the current epoch after scheduler-side
+    // task validation succeeds.
     accepted_tasks: HashMap<usize, Vec<ShuffleArtifactKey>>,
 }
 
@@ -265,7 +305,12 @@ impl ShuffleExchangeState {
     /// Exact replay is idempotent, including after the exchange is sealed.
     /// Conflicting replay and all malformed publications fail before any state
     /// changes. All non-empty artifacts in one accepted publication receive the
-    /// same event sequence.
+    /// same event cursor.
+    ///
+    /// The caller must first validate that the producer task report is still
+    /// authorized by scheduler task state. It then publishes into the exchange
+    /// epoch that is current at commit time. A task that had not materialized
+    /// output in a retired epoch may therefore commit into the new epoch.
     pub(crate) fn publish(
         &mut self,
         epoch: ShuffleExchangeEpoch,
@@ -345,6 +390,69 @@ impl ShuffleExchangeState {
         })
     }
 
+    /// Invalidates accepted output for the specified producer tasks.
+    ///
+    /// Recovery is task-granular: if one artifact from a producer task is lost,
+    /// every artifact and the accepted-publication record for that task must be
+    /// replaced together. Unknown task IDs are ignored so duplicate loss
+    /// notifications cannot churn the epoch.
+    pub(crate) fn invalidate_tasks(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+        lost_tasks: &[usize],
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+
+        let mut invalidated = BTreeSet::new();
+        for &task in lost_tasks {
+            if self.accepted_tasks.contains_key(&task) {
+                invalidated.insert(task);
+            }
+        }
+        self.roll_epoch(invalidated, false)
+    }
+
+    /// Invalidates producer tasks owning the specified materialized artifacts.
+    ///
+    /// Unknown artifact keys are ignored. A known artifact invalidates its whole
+    /// producer task because Ballista retries producer output at task granularity.
+    pub(crate) fn invalidate_artifacts(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+        lost_artifacts: &[ShuffleArtifactKey],
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+
+        let mut invalidated = BTreeSet::new();
+        for key in lost_artifacts {
+            if self.artifacts.contains_key(key) {
+                invalidated.insert(key.producer_task_id());
+            }
+        }
+        self.roll_epoch(invalidated, false)
+    }
+
+    /// Invalidates every accepted publication in the current epoch.
+    ///
+    /// This is the stage-attempt rollback primitive. Once the computation that
+    /// produced an exchange is discarded, no publication from that attempt may
+    /// survive merely because scheduler task status was already rewritten to
+    /// ResultLost/TaskKilled. Accepted empty publications are included.
+    ///
+    /// Unlike task/artifact loss, this always rolls the epoch even when no
+    /// publication has been accepted yet. A full producer-attempt reset retires
+    /// the generation itself: future incremental consumers may already be
+    /// subscribed to an open empty exchange and must be able to observe that
+    /// generation change.
+    pub(crate) fn invalidate_all(
+        &mut self,
+        epoch: ShuffleExchangeEpoch,
+    ) -> Result<ShuffleInvalidationResult> {
+        self.ensure_epoch(epoch)?;
+        let invalidated = self.accepted_tasks.keys().copied().collect();
+        self.roll_epoch(invalidated, true)
+    }
+
     /// Seals the current epoch.
     ///
     /// The first seal is reader-visible and consumes one event sequence.
@@ -396,6 +504,89 @@ impl ShuffleExchangeState {
                     .expect("shuffle partition index must reference a committed artifact")
             })
             .collect())
+    }
+
+    fn roll_epoch(
+        &mut self,
+        invalidated_tasks: BTreeSet<usize>,
+        force_rollover: bool,
+    ) -> Result<ShuffleInvalidationResult> {
+        if invalidated_tasks.is_empty() && !force_rollover {
+            return Ok(ShuffleInvalidationResult::Unchanged);
+        }
+
+        // Epoch overflow is checked before replacement state is built, so the
+        // operation is fail-closed and leaves the old history intact.
+        let previous_epoch = self.cursor.epoch();
+        let current_epoch = previous_epoch
+            .checked_next()
+            .ok_or(ShuffleExchangeError::EpochExhausted)?;
+
+        let mut retained = Vec::with_capacity(self.artifacts.len());
+        for (key, artifact) in &self.artifacts {
+            if !invalidated_tasks.contains(&key.producer_task_id) {
+                retained.push((*key, artifact.location.clone()));
+            }
+        }
+        retained.sort_by_key(|(key, _)| *key);
+
+        let initial_cursor = ShuffleExchangeCursor::initial(current_epoch);
+        let bootstrap_cursor = if retained.is_empty() {
+            None
+        } else {
+            Some(
+                initial_cursor
+                    .checked_next()
+                    .expect("initial shuffle exchange cursor must advance"),
+            )
+        };
+        let cursor = bootstrap_cursor.unwrap_or(initial_cursor);
+
+        let mut artifacts = HashMap::with_capacity(retained.len());
+        let mut partition_index:
+            HashMap<usize, Vec<(ShuffleExchangeCursor, ShuffleArtifactKey)>> =
+            HashMap::new();
+
+        for (key, location) in retained {
+            artifacts.insert(
+                key,
+                PublishedShuffleArtifact {
+                    cursor,
+                    location,
+                },
+            );
+            partition_index
+                .entry(key.output_partition_id)
+                .or_default()
+                .push((cursor, key));
+        }
+        for entries in partition_index.values_mut() {
+            entries.sort_by_key(|(_, key)| *key);
+        }
+
+        let mut accepted_tasks = HashMap::with_capacity(self.accepted_tasks.len());
+        for (task, keys) in &self.accepted_tasks {
+            if !invalidated_tasks.contains(task) {
+                accepted_tasks.insert(*task, keys.clone());
+            }
+        }
+
+        let rollover = ShuffleEpochRollover {
+            previous_epoch,
+            current_epoch,
+            bootstrap_cursor,
+            invalidated_tasks: invalidated_tasks.iter().copied().collect(),
+            retained_task_count: accepted_tasks.len(),
+            retained_artifact_count: artifacts.len(),
+        };
+
+        self.cursor = cursor;
+        self.lifecycle = ShuffleExchangeLifecycle::Open;
+        self.artifacts = artifacts;
+        self.partition_index = partition_index;
+        self.accepted_tasks = accepted_tasks;
+
+        Ok(ShuffleInvalidationResult::Rolled(rollover))
     }
 
     fn ensure_epoch(&self, epoch: ShuffleExchangeEpoch) -> Result<()> {
@@ -762,6 +953,233 @@ mod tests {
                 current: ShuffleExchangeEpoch::INITIAL,
             }
         );
+    }
+
+    #[test]
+    fn task_invalidation_rolls_epoch_and_rebases_survivors() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        let task_zero = vec![location(0, 0, Some(10)), location(0, 1, Some(11))];
+        let task_one = vec![location(1, 0, Some(20))];
+
+        state.publish(epoch_one, 0, task_zero.clone()).unwrap();
+        state.publish(epoch_one, 1, task_one.clone()).unwrap();
+
+        let result = state.invalidate_tasks(epoch_one, &[0]).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+        let epoch_two = rollover.current_epoch;
+
+        assert_eq!(rollover.previous_epoch, epoch_one);
+        assert_eq!(epoch_two.get(), 2);
+        assert_eq!(
+            rollover.bootstrap_cursor,
+            Some(cursor(epoch_two, 1))
+        );
+        assert_eq!(rollover.invalidated_tasks, vec![0]);
+        assert_eq!(rollover.retained_task_count, 1);
+        assert_eq!(rollover.retained_artifact_count, 1);
+        assert_eq!(state.cursor(), cursor(epoch_two, 1));
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(!state.is_task_accepted(0));
+        assert!(state.is_task_accepted(1));
+
+        assert!(matches!(
+            state.artifacts_after(ShuffleExchangeCursor::initial(epoch_one), 0),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+
+        // Surviving publication remains an exact replay in the new epoch.
+        assert_eq!(
+            state.publish(epoch_two, 1, task_one).unwrap(),
+            ShufflePublicationResult::Replay
+        );
+
+        // Invalidated output can be replaced.
+        assert_eq!(
+            state.publish(epoch_two, 0, task_zero).unwrap(),
+            ShufflePublicationResult::Committed {
+                event_cursor: Some(cursor(epoch_two, 2))
+            }
+        );
+
+        // A task that never materialized output in epoch one may finish after
+        // rollover and commit into the current epoch once scheduler task-state
+        // validation says its attempt is still authorized.
+        assert_eq!(
+            state
+                .publish(epoch_two, 2, vec![location(2, 0, Some(30))])
+                .unwrap(),
+            ShufflePublicationResult::Committed {
+                event_cursor: Some(cursor(epoch_two, 3))
+            }
+        );
+    }
+
+    #[test]
+    fn artifact_loss_invalidates_whole_producer_task() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        let task_zero = vec![location(0, 0, Some(10)), location(0, 1, Some(11))];
+
+        state.publish(epoch_one, 0, task_zero.clone()).unwrap();
+        state
+            .publish(epoch_one, 1, vec![location(1, 0, Some(20))])
+            .unwrap();
+
+        let lost = ShuffleArtifactKey::from_location(&task_zero[0]);
+        let result = state.invalidate_artifacts(epoch_one, &[lost]).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+
+        assert_eq!(rollover.invalidated_tasks, vec![0]);
+        assert!(!state.is_task_accepted(0));
+        assert!(state.is_task_accepted(1));
+    }
+
+    #[test]
+    fn invalidate_all_fences_every_accepted_publication_once() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.publish(epoch_one, 1, vec![]).unwrap();
+        state
+            .publish(epoch_one, 2, vec![location(2, 1, Some(20))])
+            .unwrap();
+
+        let result = state.invalidate_all(epoch_one).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected epoch rollover")
+        };
+
+        assert_eq!(rollover.invalidated_tasks, vec![0, 1, 2]);
+        assert_eq!(rollover.retained_task_count, 0);
+        assert_eq!(rollover.retained_artifact_count, 0);
+        assert_eq!(rollover.bootstrap_cursor, None);
+        assert_eq!(state.epoch().get(), 2);
+        assert_eq!(
+            state.cursor(),
+            ShuffleExchangeCursor::initial(state.epoch())
+        );
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(!state.has_committed_artifacts());
+        assert!(!state.is_task_accepted(0));
+        assert!(!state.is_task_accepted(1));
+        assert!(!state.is_task_accepted(2));
+    }
+
+    #[test]
+    fn invalidate_all_without_output_still_retires_the_generation() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        let result = state.invalidate_all(epoch_one).unwrap();
+        let ShuffleInvalidationResult::Rolled(rollover) = result else {
+            panic!("expected forced epoch rollover")
+        };
+
+        let epoch_two = state.epoch();
+        assert_eq!(rollover.previous_epoch, epoch_one);
+        assert_eq!(rollover.current_epoch, epoch_two);
+        assert!(epoch_two > epoch_one);
+        assert!(rollover.invalidated_tasks.is_empty());
+        assert_eq!(rollover.retained_task_count, 0);
+        assert_eq!(rollover.retained_artifact_count, 0);
+        assert_eq!(rollover.bootstrap_cursor, None);
+        assert_eq!(
+            state.cursor(),
+            ShuffleExchangeCursor::initial(epoch_two)
+        );
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+    }
+
+    #[test]
+    fn unknown_and_duplicate_loss_signals_do_not_churn_epoch() {
+        let mut state = exchange();
+        let epoch = state.epoch();
+        state
+            .publish(epoch, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+
+        assert_eq!(
+            state.invalidate_tasks(epoch, &[99, 99]).unwrap(),
+            ShuffleInvalidationResult::Unchanged
+        );
+        assert_eq!(state.epoch(), epoch);
+
+        let unknown = ShuffleArtifactKey {
+            producer_task_id: 0,
+            output_partition_id: 0,
+            file_id: Some(999),
+        };
+        assert_eq!(
+            state.invalidate_artifacts(epoch, &[unknown]).unwrap(),
+            ShuffleInvalidationResult::Unchanged
+        );
+        assert_eq!(state.epoch(), epoch);
+    }
+
+    #[test]
+    fn unknown_specific_loss_is_noop_but_full_attempt_reset_rolls() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+
+        assert_eq!(
+            state.invalidate_tasks(epoch_one, &[42]).unwrap(),
+            ShuffleInvalidationResult::Unchanged
+        );
+        assert_eq!(state.epoch(), epoch_one);
+
+        assert!(matches!(
+            state.invalidate_all(epoch_one).unwrap(),
+            ShuffleInvalidationResult::Rolled(_)
+        ));
+        assert!(state.epoch() > epoch_one);
+    }
+
+    #[test]
+    fn invalidation_reopens_sealed_exchange_and_stale_epoch_fails_closed() {
+        let mut state = exchange();
+        let epoch_one = state.epoch();
+        state
+            .publish(epoch_one, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        state.seal(epoch_one).unwrap();
+
+        state.invalidate_tasks(epoch_one, &[0]).unwrap();
+        let epoch_two = state.epoch();
+
+        assert_eq!(state.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(epoch_two > epoch_one);
+        assert!(matches!(
+            state.invalidate_all(epoch_one),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+        assert_eq!(state.epoch(), epoch_two);
+    }
+
+    #[test]
+    fn epoch_exhaustion_leaves_previous_state_intact() {
+        let mut state = exchange();
+        let epoch = ShuffleExchangeEpoch::new(u64::MAX).unwrap();
+        state.cursor = ShuffleExchangeCursor::initial(epoch);
+        state
+            .publish(epoch, 0, vec![location(0, 0, Some(10))])
+            .unwrap();
+        let before = state.cursor();
+
+        assert_eq!(
+            state.invalidate_all(epoch).unwrap_err(),
+            ShuffleExchangeError::EpochExhausted
+        );
+        assert_eq!(state.cursor(), before);
+        assert!(state.is_task_accepted(0));
+        assert!(state.has_committed_artifacts());
     }
 
     #[test]
