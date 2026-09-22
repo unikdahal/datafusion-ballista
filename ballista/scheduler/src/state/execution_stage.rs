@@ -162,6 +162,8 @@ pub struct UnresolvedStage {
 /// then we call it as a resolved stage
 #[derive(Clone)]
 pub struct ResolvedStage {
+    /// Pinned input histories, reconstructed from the immutable physical plan.
+    pub admission: StageAdmission,
     /// Stage ID
     pub stage_id: usize,
     /// Stage Attempt number
@@ -189,6 +191,8 @@ pub struct ResolvedStage {
 ///    Running stages will only be maintained in memory and will not saved to the backend storage
 #[derive(Clone)]
 pub struct RunningStage {
+    /// Tail work is revocable while any pinned producer is unsealed.
+    pub admission: StageAdmission,
     /// Stage ID
     pub stage_id: usize,
     /// Stage Attempt number
@@ -541,6 +545,24 @@ impl UnresolvedStage {
             self.session_config.clone(),
         ))
     }
+
+    /// Resolve descriptors without completion-dependent optimizer rules.
+    pub fn to_pipelined_resolved(
+        &self,
+        handles: &HashMap<usize, ballista_core::serde::protobuf::ShuffleInputHandle>,
+    ) -> Result<ResolvedStage> {
+        let plan =
+            crate::planner::resolve_pipelined_shuffles(self.plan.clone(), handles)?;
+        Ok(ResolvedStage::new(
+            self.stage_id,
+            self.stage_attempt_num,
+            plan,
+            self.output_links.clone(),
+            self.inputs.clone(),
+            self.last_attempt_failure_reasons.clone(),
+            self.session_config.clone(),
+        ))
+    }
 }
 
 impl Debug for UnresolvedStage {
@@ -559,6 +581,59 @@ impl Debug for UnresolvedStage {
     }
 }
 
+/// Scheduling mode is independent of structural plan eligibility.
+#[derive(Debug, Clone, Default)]
+pub enum StageAdmission {
+    #[default]
+    Normal,
+    TailPipelined(Vec<ballista_core::serde::protobuf::ShuffleInputHandle>),
+}
+
+impl StageAdmission {
+    fn from_plan(plan: &Arc<dyn ExecutionPlan>) -> Self {
+        fn visit(
+            plan: &dyn ExecutionPlan,
+            inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
+        ) {
+            if let Some(reader) = plan
+                .downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>()
+            {
+                inputs.push(reader.handle.clone());
+            }
+            for child in plan.children() {
+                visit(child.as_ref(), inputs);
+            }
+        }
+
+        let mut inputs = vec![];
+        visit(plan.as_ref(), &mut inputs);
+        canonicalize_admission_handles(&mut inputs);
+        if inputs.is_empty() {
+            Self::Normal
+        } else {
+            Self::TailPipelined(inputs)
+        }
+    }
+}
+
+/// Admission metadata is recovery state, so it must not depend on physical-plan
+/// traversal order or repeated references to the same producer generation.
+fn canonicalize_admission_handles(
+    inputs: &mut Vec<ballista_core::serde::protobuf::ShuffleInputHandle>,
+) {
+    inputs.sort_by(|a, b| {
+        a.job_id
+            .cmp(&b.job_id)
+            .then_with(|| a.stage_id.cmp(&b.stage_id))
+            .then_with(|| a.generation.cmp(&b.generation))
+    });
+    inputs.dedup_by(|a, b| {
+        a.job_id == b.job_id
+            && a.stage_id == b.stage_id
+            && a.generation == b.generation
+    });
+}
+
 impl ResolvedStage {
     /// Creates a new resolved stage ready for task scheduling.
     pub fn new(
@@ -573,6 +648,7 @@ impl ResolvedStage {
         let partitions = stage_input_partitions(&plan);
 
         Self {
+            admission: StageAdmission::from_plan(&plan),
             stage_id,
             stage_attempt_num,
             partitions,
@@ -638,6 +714,7 @@ impl RunningStage {
         session_config: Arc<SessionConfig>,
     ) -> Self {
         Self {
+            admission: StageAdmission::from_plan(&plan),
             stage_id,
             stage_attempt_num,
             stage_running_time: SystemTime::now()
@@ -790,18 +867,10 @@ impl RunningStage {
         self.pending.remaining()
     }
 
-    /// Apply a status update for the task at `task_id` (its append slot in
-    /// `task_infos`).
-    ///
-    /// Rejects (returns false) if the task's status is already terminal
-    /// Failed with a lost/killed reason (i.e., `reset_tasks` moved its
-    /// partitions back to pending because the executor died) — a late
-    /// status from that attempt should be ignored.
-    ///
-    /// On success, updates the task's status and adjusts per-partition
-    /// failure counters using the task's `global_input_partition_ids`.
-    pub fn update_task_info(&mut self, task_id: usize, status: TaskStatus) -> bool {
-        debug!("Updating TaskInfo for task_id {task_id}");
+    /// Check whether a task status may still be accepted without mutating the
+    /// running stage. Pipelined shuffle publication uses this before preparing
+    /// a registry commit so a rejected late status can never publish data.
+    pub(crate) fn can_update_task_info(&self, task_id: usize) -> bool {
         let task_info = &self.task_infos[task_id];
         if let task_status::Status::Failed(FailedTask {
             failed_reason:
@@ -814,10 +883,60 @@ impl RunningStage {
             );
             return false;
         }
+        true
+    }
+
+    /// Stronger success-validation used only when pipelined shuffle metadata
+    /// will be published. The legacy feature-off path intentionally retains
+    /// its existing status-update behavior.
+    pub(crate) fn can_publish_task_success(
+        &self,
+        task_id: usize,
+        status: &TaskStatus,
+    ) -> bool {
+        if !self.can_update_task_info(task_id) {
+            return false;
+        }
+        if matches!(
+            &self.task_infos[task_id].task_status,
+            task_status::Status::Successful(_)
+        ) && matches!(
+            status.status.as_ref(),
+            Some(task_status::Status::Successful(_))
+        ) {
+            debug!(
+                "Ignore replayed successful TaskStatus for task_id {task_id}; shuffle publication is already committed"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Apply a status update for the task at `task_id` (its append slot in
+    /// `task_infos`). Returns false when a reset/lost task update is
+    /// intentionally ignored.
+    pub fn update_task_info(&mut self, task_id: usize, status: TaskStatus) -> bool {
+        debug!("Updating TaskInfo for task_id {task_id}");
+        if !self.can_update_task_info(task_id) {
+            return false;
+        }
+        self.apply_task_info(task_id, status);
+        true
+    }
+
+    /// Apply a status that has already passed `can_update_task_info`.
+    ///
+    /// This is deliberately infallible: the pipelined publication transaction
+    /// performs every fallible validation first, then updates graph state and
+    /// commits the prepared registry mutation while holding the registry lock.
+    pub(crate) fn apply_task_info(&mut self, task_id: usize, status: TaskStatus) {
+        let task_info = &self.task_infos[task_id];
         let scheduled_time = task_info.scheduled_time;
         let global_input_partition_ids = task_info.global_input_partition_ids.clone();
         let vcores_consumed = task_info.vcores_consumed;
-        let task_status = status.status.unwrap();
+        let task_status = status
+            .status
+            .expect("TaskStatus was validated before apply_task_info");
         let updated_task_info = TaskInfo {
             task_id,
             scheduled_time,
@@ -847,7 +966,6 @@ impl RunningStage {
             }
             _ => {}
         }
-        true
     }
 
     /// Accumulate the `RuntimeStatsReport`s a successful task shipped
@@ -896,21 +1014,23 @@ impl RunningStage {
             }));
     }
 
-    /// update and upsert the task metrics to the stage metrics
-    pub fn update_task_metrics(
-        &mut self,
+    /// Prepare the post-success metrics snapshot without mutating the stage.
+    ///
+    /// Any malformed metric payload is rejected here, before shuffle metadata
+    /// is published or the task is marked successful.
+    pub(crate) fn prepare_task_metrics(
+        &self,
         task_id: usize,
         metrics: Vec<OperatorMetricsSet>,
-    ) -> Result<()> {
-        // For some cases, task metrics not set, especially for testings.
+    ) -> Result<Option<Vec<MetricsSet>>> {
         if metrics.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let global_partitions =
             self.task_infos[task_id].global_input_partition_ids.clone();
 
-        let new_metrics_set = if let Some(combined_metrics) = &mut self.stage_metrics {
+        let new_metrics_set = if let Some(combined_metrics) = &self.stage_metrics {
             if metrics.len() != combined_metrics.len() {
                 return Err(BallistaError::Internal(format!(
                     "Error updating task metrics to stage {}, task metrics array size {} does not equal \
@@ -927,7 +1047,7 @@ impl RunningStage {
                 .collect::<Result<Vec<_>>>()?;
 
             combined_metrics
-                .iter_mut()
+                .iter()
                 .zip(metrics_values_array)
                 .map(|(existing_metrics, new_task_metrics)| {
                     Self::upsert_metrics_set_for_task(
@@ -943,8 +1063,27 @@ impl RunningStage {
                 .map(|ms| Self::metrics_set_from_task_metrics(ms, &global_partitions))
                 .collect::<Result<Vec<_>>>()?
         };
-        self.stage_metrics = Some(new_metrics_set);
 
+        Ok(Some(new_metrics_set))
+    }
+
+    pub(crate) fn apply_prepared_task_metrics(
+        &mut self,
+        prepared: Option<Vec<MetricsSet>>,
+    ) {
+        if let Some(metrics) = prepared {
+            self.stage_metrics = Some(metrics);
+        }
+    }
+
+    /// Update and upsert the task metrics to the stage metrics.
+    pub fn update_task_metrics(
+        &mut self,
+        task_id: usize,
+        metrics: Vec<OperatorMetricsSet>,
+    ) -> Result<()> {
+        let prepared = self.prepare_task_metrics(task_id, metrics)?;
+        self.apply_prepared_task_metrics(prepared);
         Ok(())
     }
 
@@ -1026,7 +1165,7 @@ impl RunningStage {
     /// snapshots, so any prior entry for one of the task's global partitions
     /// is replaced by the new snapshot.
     pub fn upsert_metrics_set_for_task(
-        existing_metrics: &mut MetricsSet,
+        existing_metrics: &MetricsSet,
         new_task_metrics: MetricsSet,
         global_partitions: &[usize],
     ) -> MetricsSet {
@@ -1208,6 +1347,7 @@ impl SuccessfulStage {
             Some(self.stage_metrics.clone())
         };
         RunningStage {
+            admission: StageAdmission::from_plan(&self.plan),
             stage_id: self.stage_id,
             stage_attempt_num: self.stage_attempt_num + 1,
             partitions: self.partitions,
@@ -1523,6 +1663,108 @@ mod tests {
             stage.task_infos[0].task_status,
             task_status::Status::Successful(_)
         ));
+    }
+
+    #[test]
+    fn test_pipelined_success_replay_is_rejected_without_changing_legacy_update() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+
+        let status = make_task_status(0);
+        assert!(stage.update_task_info(0, status.clone()));
+        assert!(!stage.can_publish_task_success(0, &status));
+
+        // The ordinary status-update API keeps the pre-feature behavior.
+        assert!(stage.update_task_info(0, status));
+        assert_eq!(stage.successful_tasks(), 1);
+        assert_eq!(stage.task_failure_numbers[0], 0);
+    }
+
+    #[test]
+    fn test_resolved_to_running_preserves_pinned_admission_generation() {
+        use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+        use datafusion::physical_plan::Partitioning;
+
+        let handle = ShuffleInputHandle {
+            job_id: "job".to_string(),
+            stage_id: 7,
+            generation: 11,
+        };
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            PipelinedShuffleReaderExec::try_new(
+                handle.clone(),
+                vec![0, 1],
+                schema,
+                Partitioning::UnknownPartitioning(2),
+            )
+            .expect("pipelined reader"),
+        );
+
+        let resolved = ResolvedStage::new(
+            8,
+            0,
+            plan,
+            vec![9],
+            HashMap::new(),
+            HashSet::new(),
+            Arc::new(SessionConfig::default()),
+        );
+        let running = resolved.to_running();
+
+        for admission in [&resolved.admission, &running.admission] {
+            let StageAdmission::TailPipelined(handles) = admission else {
+                panic!("expected tail-pipelined admission");
+            };
+            assert_eq!(handles.len(), 1);
+            assert_eq!(handles[0].job_id, handle.job_id);
+            assert_eq!(handles[0].stage_id, handle.stage_id);
+            assert_eq!(handles[0].generation, handle.generation);
+        }
+    }
+
+    #[test]
+    fn test_admission_handles_are_deduplicated_and_deterministic() {
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+
+        let mut handles = vec![
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 3,
+                generation: 2,
+            },
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 1,
+                generation: 4,
+            },
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 3,
+                generation: 2,
+            },
+            ShuffleInputHandle {
+                job_id: "another".to_string(),
+                stage_id: 9,
+                generation: 1,
+            },
+        ];
+
+        canonicalize_admission_handles(&mut handles);
+
+        let identities: Vec<_> = handles
+            .iter()
+            .map(|h| (h.job_id.as_str(), h.stage_id, h.generation))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("another", 9, 1),
+                ("job", 1, 4),
+                ("job", 3, 2),
+            ]
+        );
     }
 
     /// After `reset_tasks` marks a task as ResultLost, a late status update

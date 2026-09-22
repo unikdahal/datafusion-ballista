@@ -798,12 +798,67 @@ pub fn remove_unresolved_shuffles(
 /// range-ness is a derived property of the child's declared ordering at plan
 /// time, not intrinsic reader metadata. Re-planning walks the adapter, which
 /// re-detects the ordering and plants a fresh `RangeShuffleReaderExec`.
+pub fn resolve_pipelined_shuffles(
+    plan: Arc<dyn ExecutionPlan>,
+    handles: &std::collections::HashMap<
+        usize,
+        ballista_core::serde::protobuf::ShuffleInputHandle,
+    >,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(reader) = plan.downcast_ref::<UnresolvedShuffleExec>() {
+        if reader.broadcast
+            || reader.coalesce.is_some()
+            || matches!(
+                reader.properties().partitioning,
+                datafusion::physical_plan::Partitioning::Range(_)
+            )
+        {
+            return Err(ballista_core::error::BallistaError::Internal(
+                "ineligible pipelined shuffle edge".into(),
+            ));
+        }
+        let handle = handles.get(&reader.stage_id).ok_or_else(|| {
+            ballista_core::error::BallistaError::Internal(
+                "missing shuffle generation".into(),
+            )
+        })?;
+        return Ok(Arc::new(
+            ballista_core::execution_plans::PipelinedShuffleReaderExec::try_new(
+                handle.clone(),
+                (0..reader.output_partition_count).collect(),
+                reader.schema(),
+                reader.properties().partitioning.clone(),
+            )?,
+        ));
+    }
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| resolve_pipelined_shuffles(child.clone(), handles))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(replace_children_if_necessary(plan, children)?)
+}
+
 pub fn rollback_resolved_shuffles(
     stage: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
     for child in stage.children() {
-        if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
+        if let Some(reader) = child
+            .downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>(
+        ) {
+            // Rollback always receives the scheduler's stored, unsliced stage
+            // plan. Task-local partition restriction is applied only when a
+            // TaskDescription is built, so reader.properties().partitioning
+            // still describes the full stage here. Reconstructing an
+            // UnresolvedShuffleExec from a task-restricted reader would lose
+            // partitions and is intentionally unsupported.
+            new_children.push(Arc::new(UnresolvedShuffleExec::new(
+                reader.handle.stage_id as usize,
+                reader.schema(),
+                reader.properties().partitioning.clone(),
+            )));
+        } else if let Some(shuffle_reader) = child.downcast_ref::<ShuffleReaderExec>() {
             let stage_id = shuffle_reader.stage_id;
             let unresolved = if shuffle_reader.broadcast {
                 Arc::new(UnresolvedShuffleExec::new_broadcast(
@@ -2062,6 +2117,48 @@ order by
         assert!(unresolved.broadcast);
         assert_eq!(unresolved.upstream_partition_count, 3);
         assert_eq!(unresolved.output_partition_count, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollback_pipelined_shuffle_preserves_full_unsliced_partitioning()
+    -> Result<(), BallistaError> {
+        use ballista_core::execution_plans::PipelinedShuffleReaderExec;
+        use ballista_core::serde::protobuf::ShuffleInputHandle;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::Partitioning;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)]));
+        let reader = Arc::new(PipelinedShuffleReaderExec::try_new(
+            ShuffleInputHandle {
+                job_id: "job".to_string(),
+                stage_id: 42,
+                generation: 7,
+            },
+            (0..4).collect(),
+            schema,
+            Partitioning::UnknownPartitioning(4),
+        )?) as Arc<dyn ExecutionPlan>;
+        let parent: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                reader,
+            ),
+        );
+
+        let rolled_back = crate::planner::rollback_resolved_shuffles(parent)?;
+        let child = rolled_back.children()[0].clone();
+        let unresolved = child
+            .downcast_ref::<UnresolvedShuffleExec>()
+            .expect("expected rolled-back UnresolvedShuffleExec");
+
+        assert_eq!(unresolved.stage_id, 42);
+        assert_eq!(unresolved.output_partition_count, 4);
+        assert_eq!(
+            unresolved.properties().output_partitioning().partition_count(),
+            4
+        );
 
         Ok(())
     }

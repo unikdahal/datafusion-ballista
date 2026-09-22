@@ -84,6 +84,8 @@ pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
     "ballista.client.io_retry_wait_time_ms";
 /// Enables adaptive query planning
 pub const BALLISTA_ADAPTIVE_PLANNER_ENABLED: &str = "ballista.planner.adaptive.enabled";
+/// Allow intermediate static shuffle stages to consume committed producer output.
+pub const BALLISTA_SHUFFLE_PIPELINED_ENABLED: &str = "ballista.shuffle.pipelined.enabled";
 /// Configuration key for sort shuffle target batch size in rows.
 pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
@@ -230,6 +232,9 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization".to_string(),
                          DataType::Boolean,
                          Some((false).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_PIPELINED_ENABLED.to_string(),
+                         "Enable experimental tail-only pipelined materialized shuffle for static plans".to_string(),
+                         DataType::Boolean, Some(false.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_READER_MAX_BYTES_IN_FLIGHT.to_string(),
                          "Reduce-side shuffle governor: maximum total in-flight bytes across concurrent remote partition fetches. Mirrors Spark's spark.reducer.maxSizeInFlight. Values above 4 GiB are clamped to 4 GiB (u32 semaphore limit).".to_string(),
                          DataType::UInt64,
@@ -725,6 +730,11 @@ impl BallistaConfig {
     /// Is Adaptive Query Planner enabled
     pub fn adaptive_query_planner_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_ADAPTIVE_PLANNER_ENABLED)
+    }
+
+    /// Whether static intermediate stages may consume committed producer tails.
+    pub fn shuffle_pipelined_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_SHUFFLE_PIPELINED_ENABLED)
     }
 
     /// Returns the target batch size for sort-based shuffle.
