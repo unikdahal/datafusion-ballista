@@ -1254,6 +1254,49 @@ impl RunningStage {
             .retain(|s| s.producer_task_id != task_id);
     }
 
+    /// Mark one already-successful task's materialized output as lost.
+    ///
+    /// A pipelined consumer can discover an unreadable shuffle block while the
+    /// producer stage is still Running because other producer tasks are still
+    /// in flight. In that state we cannot use `SuccessfulStage::to_running`:
+    /// the producer is already running. Retire the accepted task in place and
+    /// reschedule its complete input slice so registry reconciliation can roll
+    /// the producer generation forward.
+    ///
+    /// This transition is idempotent. Repeated fetch-failure reports for the
+    /// same materialized task do not enqueue its partitions more than once.
+    pub fn mark_materialized_result_lost(
+        &mut self,
+        task_id: usize,
+        error: impl Into<String>,
+    ) -> bool {
+        let Some(task) = self.task_infos.get_mut(task_id) else {
+            return false;
+        };
+        if !matches!(task.task_status, task_status::Status::Successful(_)) {
+            return false;
+        }
+
+        let partitions = task.global_input_partition_ids.clone();
+        task.launch_time = 0;
+        task.start_exec_time = 0;
+        task.end_exec_time = 0;
+        task.finish_time = 0;
+        task.task_status = task_status::Status::Failed(FailedTask {
+            error: error.into(),
+            retryable: true,
+            count_to_failures: false,
+            failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
+        });
+
+        self.pending.reschedule(partitions);
+        self.runtime_stats_reports
+            .retain(|s| s.producer_task_id != task_id);
+        self.window_state_reports
+            .retain(|s| s.producer_task_id != task_id);
+        true
+    }
+
     /// Reset the running and completed tasks on a given executor by
     /// marking their `TaskInfo` as `Failed(ResultLost)` and pushing their
     /// partition slices back to `pending`. Returns the number of tasks
@@ -2132,6 +2175,55 @@ mod tests {
             partition_key: vec![],
             state: vec![],
         }
+    }
+
+    #[test]
+    fn materialized_result_loss_is_idempotent_and_reschedules_once() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        append_running_task(&mut stage, 1, "executor-2", vec![1]);
+        stage.pending.next_slice(2);
+
+        for (task_id, executor) in [(0, "executor-1"), (1, "executor-2")] {
+            stage.task_infos[task_id].task_status =
+                task_status::Status::Successful(SuccessfulTask {
+                    executor_id: executor.to_string(),
+                    partitions: vec![],
+                    runtime_stats: vec![],
+                    window_state: vec![],
+                });
+            stage.append_runtime_stats_reports(
+                task_id,
+                vec![make_report(100 + task_id as u32)],
+            );
+            stage.append_window_state_reports(
+                task_id,
+                vec![make_window_state(task_id as u32)],
+            );
+        }
+
+        assert!(stage.mark_materialized_result_lost(
+            0,
+            "shuffle output became unreadable"
+        ));
+        assert!(!stage.mark_materialized_result_lost(
+            0,
+            "duplicate fetch failure"
+        ));
+
+        assert_eq!(stage.pending.remaining(), 1);
+        assert_eq!(stage.pending.next_slice(2), vec![0]);
+        assert!(matches!(
+            stage.task_infos[0].task_status,
+            task_status::Status::Failed(FailedTask {
+                failed_reason: Some(FailedReason::ResultLost(_)),
+                ..
+            })
+        ));
+        assert_eq!(stage.runtime_stats_reports.len(), 1);
+        assert_eq!(stage.runtime_stats_reports[0].producer_task_id, 1);
+        assert_eq!(stage.window_state_reports.len(), 1);
+        assert_eq!(stage.window_state_reports[0].producer_task_id, 1);
     }
 
     /// Executor loss resets every task the executor was hosting; the
