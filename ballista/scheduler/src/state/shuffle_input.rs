@@ -483,7 +483,6 @@ impl ShuffleInputRegistry {
         Some(output)
     }
 
-
     fn current(
         &self,
         job: &JobId,
@@ -819,8 +818,7 @@ mod tests {
         // resurrect task 0 from the retired attempt.
         registry.commit(&job, 1, 2, 2, vec![location(2, 0), location(2, 1)])?;
         assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
-        let ShuffleInputRead::Update(snapshot) =
-            registry.read(&job, 1, 2, 0, &[0, 1])?
+        let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 2, 0, &[0, 1])?
         else {
             panic!()
         };
@@ -846,7 +844,6 @@ mod tests {
         );
         Ok(())
     }
-
 
     #[test]
     fn empty_producing_input_is_not_sealed() -> Result<()> {
