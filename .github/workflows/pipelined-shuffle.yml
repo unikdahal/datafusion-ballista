@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ref: ${{ inputs.stack && fromJSON('["shuffle/01-input-state","shuffle/02-metadata-protocol","shuffle/03-pipelined-reader","shuffle/04-task-restriction","shuffle/05-stage-resolution","shuffle/06-tail-scheduling","shuffle/07-recovery","shuffle/08-validation"]') || fromJSON('[""]') }}
+        ref: ${{ inputs.stack && fromJSON('["shuffle/01-input-state","shuffle/02-metadata-protocol","shuffle/03-pipelined-reader","shuffle/04-task-restriction","shuffle/05-stage-resolution","shuffle/06-tail-scheduling","shuffle/07-recovery","shuffle/08-validation","shuffle/review-hardening"]') || fromJSON('[""]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
