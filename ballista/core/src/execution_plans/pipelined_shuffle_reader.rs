@@ -134,6 +134,61 @@ mod tests {
         }
     }
 
+    /// Scripted metadata source whose second response is held until the test
+    /// explicitly releases it. The reader polls metadata concurrently with data
+    /// fetches, so tests that assert "consume old-generation data, then observe
+    /// the next metadata event" must encode that ordering instead of relying on
+    /// scheduler timing.
+    #[derive(Debug)]
+    struct GatedSecondSource {
+        responses: Mutex<VecDeque<pb::ShuffleInputResult>>,
+        cursors: Mutex<Vec<Option<u64>>>,
+        calls: AtomicUsize,
+        release_second: tokio::sync::Notify,
+    }
+
+    impl GatedSecondSource {
+        fn new(responses: Vec<pb::ShuffleInputResult>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into()),
+                cursors: Mutex::new(vec![]),
+                calls: AtomicUsize::new(0),
+                release_second: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn release_second(&self) {
+            self.release_second.notify_one();
+        }
+
+        fn cursors(&self) -> Vec<Option<u64>> {
+            self.cursors.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ShuffleInputClient for GatedSecondSource {
+        async fn update(
+            &self,
+            handle: pb::ShuffleInputHandle,
+            partition: u32,
+            after: Option<u64>,
+        ) -> std::result::Result<pb::ShuffleInputResult, tonic::Status> {
+            assert_eq!(handle.job_id, "job");
+            assert_eq!(handle.stage_id, 1);
+            assert_eq!(handle.generation, 1);
+            assert_eq!(partition, 6);
+            self.cursors.lock().unwrap().push(after);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 {
+                self.release_second.notified().await;
+            }
+            self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                tonic::Status::internal("unexpected shuffle metadata poll")
+            })
+        }
+    }
+
     fn metadata_update(
         version: u64,
         lifecycle: i32,
@@ -500,12 +555,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let schema = test_schema();
         let location = materialized_location(&directory, 0, 0, 11, &schema)?;
-        let source = ScriptedSource::new(vec![
+        let source = GatedSecondSource::new(vec![
             metadata_update(1, 0, vec![(1, location.clone())]),
             metadata_update(2, 1, vec![(2, location)]),
         ]);
-        let mut stream = execute_script(source, &directory, schema)?;
+        let mut stream = execute_script(source.clone(), &directory, schema)?;
         assert!(stream.next().await.unwrap().is_ok());
+        source.release_second();
         let error = stream.next().await.unwrap().unwrap_err();
         assert!(
             error
@@ -572,7 +628,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let schema = test_schema();
         let location = materialized_location(&directory, 0, 0, 13, &schema)?;
-        let source = ScriptedSource::new(vec![
+        let source = GatedSecondSource::new(vec![
             metadata_update(1, 0, vec![(1, location)]),
             invalidated(1, 2),
         ]);
@@ -589,6 +645,7 @@ mod tests {
             .unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(values.value(0), 13);
+        source.release_second();
         let error = stream
             .next()
             .await
