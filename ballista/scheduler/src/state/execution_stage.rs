@@ -43,8 +43,10 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::PartitionLocation;
+use ballista_core::shuffle::ShuffleExchangeEpoch;
 
 use crate::display::DisplayableBallistaExecutionPlan;
+use crate::state::shuffle_exchange::{ShuffleExchangeError, ShuffleExchangeState};
 
 /// A stage in the ExecutionGraph representing a set of tasks that can be executed concurrently.
 ///
@@ -1366,6 +1368,26 @@ impl StageOutput {
         }
     }
 
+    /// Builds the legacy barrier-consumer view from a sealed canonical exchange.
+    ///
+    /// StageOutput remains a compatibility type while graph recovery still
+    /// mutates per-parent caches. Completed barrier input must be projected from
+    /// ShuffleExchangeState rather than trusting those caches as authoritative.
+    // This adapter lands one PR before graph wiring so the projection contract
+    // can be reviewed independently. Remove the allowance when graph code uses it.
+    #[allow(dead_code)]
+    pub(crate) fn from_sealed_exchange(
+        exchange: &ShuffleExchangeState,
+        epoch: ShuffleExchangeEpoch,
+    ) -> std::result::Result<Self, ShuffleExchangeError> {
+        let mut output = Self::new();
+        for location in exchange.barrier_locations(epoch)? {
+            output.add_partition(location);
+        }
+        output.complete = true;
+        Ok(output)
+    }
+
     /// Adds a `PartitionLocation` to this stage output.
     pub fn add_partition(&mut self, partition_location: PartitionLocation) {
         if let Some(parts) = self
@@ -1418,9 +1440,171 @@ mod tests {
     use ballista_core::serde::protobuf::{
         OperatorMetric, SuccessfulTask, TaskStatus, operator_metric, task_status,
     };
+    use ballista_core::serde::scheduler::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+        PartitionId, PartitionStats,
+    };
+    use ballista_core::shuffle::ShuffleExchangeId;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionConfig;
     use std::collections::HashMap;
+
+    fn exchange_location(
+        task_id: usize,
+        output_partition_id: usize,
+        file_id: Option<u64>,
+    ) -> PartitionLocation {
+        PartitionLocation {
+            map_partition_id: task_id,
+            partition_id: PartitionId::new(
+                &ballista_core::JobId::from("exchange-job"),
+                7,
+                output_partition_id,
+            ),
+            executor_meta: ExecutorMetadata {
+                id: format!("executor-{task_id}"),
+                host: "localhost".into(),
+                port: 50051,
+                grpc_port: 50052,
+                specification: ExecutorSpecification::default(),
+                os_info: ExecutorOperatingSystemSpecification::default(),
+            },
+            partition_stats: PartitionStats::new(Some(10), Some(1), Some(100)),
+            file_id,
+            is_sort_shuffle: true,
+        }
+    }
+
+    fn sealed_exchange() -> ShuffleExchangeState {
+        let mut exchange = ShuffleExchangeState::new(ShuffleExchangeId::new(
+            ballista_core::JobId::from("exchange-job"),
+            7,
+        ));
+        let epoch = exchange.epoch();
+
+        // Deliberately publish out of task order. The projection must be
+        // canonical rather than dependent on status-arrival order.
+        exchange
+            .publish(
+                epoch,
+                2,
+                vec![
+                    exchange_location(2, 0, Some(21)),
+                    exchange_location(2, 1, Some(22)),
+                ],
+            )
+            .unwrap();
+        exchange
+            .publish(
+                epoch,
+                0,
+                vec![
+                    exchange_location(0, 0, Some(1)),
+                    exchange_location(0, 0, Some(2)),
+                ],
+            )
+            .unwrap();
+        exchange.publish(epoch, 1, vec![]).unwrap();
+        exchange.seal(epoch).unwrap();
+        exchange
+    }
+
+    #[test]
+    fn stage_output_projection_requires_sealed_exchange() {
+        let mut exchange = ShuffleExchangeState::new(ShuffleExchangeId::new(
+            ballista_core::JobId::from("exchange-job"),
+            7,
+        ));
+        let epoch = exchange.epoch();
+        exchange
+            .publish(epoch, 0, vec![exchange_location(0, 0, Some(1))])
+            .unwrap();
+
+        assert!(matches!(
+            StageOutput::from_sealed_exchange(&exchange, epoch),
+            Err(ShuffleExchangeError::BarrierSnapshotBeforeSeal { epoch: e })
+                if e == epoch
+        ));
+    }
+
+    #[test]
+    fn stage_output_projection_is_complete_and_deterministic() {
+        let exchange = sealed_exchange();
+        let output =
+            StageOutput::from_sealed_exchange(&exchange, exchange.epoch()).unwrap();
+
+        assert!(output.is_complete());
+        assert_eq!(output.partition_locations.len(), 2);
+
+        let partition_zero = &output.partition_locations[&0];
+        assert_eq!(partition_zero.len(), 3);
+        assert_eq!(partition_zero[0].map_partition_id, 0);
+        assert_eq!(partition_zero[0].file_id, Some(1));
+        assert_eq!(partition_zero[1].map_partition_id, 0);
+        assert_eq!(partition_zero[1].file_id, Some(2));
+        assert_eq!(partition_zero[2].map_partition_id, 2);
+        assert_eq!(partition_zero[2].file_id, Some(21));
+
+        let partition_one = &output.partition_locations[&1];
+        assert_eq!(partition_one.len(), 1);
+        assert_eq!(partition_one[0].map_partition_id, 2);
+        assert_eq!(partition_one[0].file_id, Some(22));
+
+        assert!(!output
+            .partition_locations
+            .values()
+            .flatten()
+            .any(|location| location.map_partition_id == 1));
+    }
+
+    #[test]
+    fn sealed_empty_exchange_projects_complete_empty_stage_output() {
+        let mut exchange = ShuffleExchangeState::new(ShuffleExchangeId::new(
+            ballista_core::JobId::from("exchange-job"),
+            7,
+        ));
+        let epoch = exchange.epoch();
+        exchange.publish(epoch, 0, vec![]).unwrap();
+        exchange.seal(epoch).unwrap();
+
+        let output = StageOutput::from_sealed_exchange(&exchange, epoch).unwrap();
+        assert!(output.is_complete());
+        assert!(output.partition_locations.is_empty());
+    }
+
+    #[test]
+    fn projection_rejects_retired_epoch_and_excludes_invalidated_output() {
+        let mut exchange = sealed_exchange();
+        let retired_epoch = exchange.epoch();
+
+        exchange.invalidate_tasks(retired_epoch, &[0]).unwrap();
+        let current_epoch = exchange.epoch();
+
+        assert!(matches!(
+            StageOutput::from_sealed_exchange(&exchange, retired_epoch),
+            Err(ShuffleExchangeError::StaleEpoch { .. })
+        ));
+        assert!(matches!(
+            StageOutput::from_sealed_exchange(&exchange, current_epoch),
+            Err(ShuffleExchangeError::BarrierSnapshotBeforeSeal { .. })
+        ));
+
+        exchange.seal(current_epoch).unwrap();
+        let output =
+            StageOutput::from_sealed_exchange(&exchange, current_epoch).unwrap();
+
+        assert!(output.is_complete());
+        assert!(output
+            .partition_locations
+            .values()
+            .flatten()
+            .all(|location| location.map_partition_id != 0));
+        assert!(output
+            .partition_locations
+            .values()
+            .flatten()
+            .any(|location| location.map_partition_id == 2));
+    }
 
     fn make_running_stage(partitions: usize) -> RunningStage {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
