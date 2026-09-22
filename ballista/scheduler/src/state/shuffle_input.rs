@@ -471,7 +471,7 @@ impl ShuffleInputRegistry {
         let lost: HashSet<_> = state
             .accepted_tasks
             .keys()
-            .filter(|task| !accepted.contains(task))
+            .filter(|task| !accepted.contains(*task))
             .copied()
             .collect();
         if lost.is_empty() {

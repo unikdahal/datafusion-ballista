@@ -516,7 +516,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     ///
     /// Statuses whose (job, stage, task_id) can no longer be resolved
     /// (e.g. the job's graph has been evicted) contribute 0.
-    pub(crate) async fn sum_vcores_for_statuses(&self, statuses: &[TaskStatus]) -> u32 {
+    pub(crate) async fn sum_vcores_for_statuses(
+        &self,
+        executor_id: &str,
+        statuses: &[TaskStatus],
+    ) -> u32 {
         let mut statuses_by_job: HashMap<String, Vec<&TaskStatus>> = HashMap::new();
         for status in statuses {
             statuses_by_job
@@ -531,7 +535,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             };
             let mut graph = graph_arc.write().await;
             for status in job_statuses {
-                total_vcores += graph.release_task_vcores(status);
+                total_vcores += graph.release_task_vcores(executor_id, status);
             }
         }
         total_vcores

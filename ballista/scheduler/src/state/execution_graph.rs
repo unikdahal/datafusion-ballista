@@ -293,7 +293,7 @@ pub trait ExecutionGraph: Debug {
     }
 
     /// Refund completed work, including tasks retired by stage rollback.
-    fn release_task_vcores(&mut self, status: &TaskStatus) -> u32 {
+    fn release_task_vcores(&mut self, _executor_id: &str, status: &TaskStatus) -> u32 {
         self.task_vcores(status.stage_id as usize, status.task_id as usize)
             .unwrap_or(0)
     }
@@ -315,7 +315,7 @@ pub trait ExecutionGraph: Debug {
 #[derive(Clone)]
 pub struct StaticExecutionGraph {
     retired_tasks: HashMap<usize, Vec<TaskInfo>>,
-    retired_vcores: HashMap<(usize, usize, usize), u32>,
+    retired_vcores: HashMap<(usize, usize, usize), (String, u32)>,
     refunded_tasks: HashSet<(usize, usize, usize)>,
     /// Operators such as LIMIT may finish without draining their inputs. Hold
     /// their success until all pinned histories seal, so it cannot escape recovery.
@@ -1063,7 +1063,7 @@ impl StaticExecutionGraph {
 }
 
 impl ExecutionGraph for StaticExecutionGraph {
-    fn release_task_vcores(&mut self, status: &TaskStatus) -> u32 {
+    fn release_task_vcores(&mut self, executor_id: &str, status: &TaskStatus) -> u32 {
         if !self.pipelining_enabled() {
             return self
                 .task_vcores(status.stage_id as usize, status.task_id as usize)
@@ -1078,18 +1078,29 @@ impl ExecutionGraph for StaticExecutionGraph {
             status.status,
             Some(task_status::Status::Successful(_) | task_status::Status::Failed(_))
         ) || self.refunded_tasks.contains(&key)
+            || status.job_id != self.job_id.as_str()
+            || matches!(&status.status,
+                Some(task_status::Status::Successful(success)) if success.executor_id != executor_id)
         {
             return 0;
         }
         let current = self.stages.get(&key.0).and_then(|stage| match stage {
-            ExecutionStage::Running(stage) if stage.stage_attempt_num == key.1 => {
+            ExecutionStage::Running(stage)
+                if stage.accepts_status_from(executor_id, status) =>
+            {
                 stage.task_infos.get(key.2).map(|task| task.vcores_consumed)
             }
             _ => None,
         });
-        let Some(vcores) = current.or_else(|| self.retired_vcores.remove(&key)) else {
+        let retired = self
+            .retired_vcores
+            .get(&key)
+            .filter(|(owner, _)| owner == executor_id)
+            .map(|(_, vcores)| *vcores);
+        let Some(vcores) = current.or(retired) else {
             return 0;
         };
+        self.retired_vcores.remove(&key);
         self.refunded_tasks.insert(key);
         vcores
     }
@@ -1205,6 +1216,14 @@ impl ExecutionGraph for StaticExecutionGraph {
         let mut job_task_statuses: HashMap<usize, Vec<TaskStatus>> = HashMap::new();
         for task_status in task_statuses {
             let stage_id = task_status.stage_id as usize;
+            if pipelining_enabled
+                && (task_status.job_id != self.job_id.as_str()
+                    || !matches!(self.stages.get(&stage_id),
+                        Some(ExecutionStage::Running(stage))
+                            if stage.accepts_status_from(&executor.id, &task_status)))
+            {
+                continue;
+            }
             if matches!(task_status.status, Some(task_status::Status::Successful(_)))
                 && let Some(ExecutionStage::Running(stage)) = self.stages.get(&stage_id)
                 && let super::execution_stage::StageAdmission::TailPipelined(handles) =
@@ -1254,6 +1273,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                 if let ExecutionStage::Running(running_stage) = stage {
                     let mut locations = vec![];
                     for task_status in stage_task_statuses.into_iter() {
+                        // Recheck after each report: a preceding terminal report
+                        // in the same batch may already have retired this slot.
+                        if pipelining_enabled
+                            && !running_stage
+                                .accepts_status_from(&executor.id, &task_status)
+                        {
+                            continue;
+                        }
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
                         let invalid_stage_attempt = if pipelining_enabled {
@@ -2015,10 +2042,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                     self.retired_tasks.get(&stage_id).map(Vec::len).unwrap_or(0);
                 let mut retired = stage.task_infos.clone();
                 for (task, info) in retired.iter_mut().enumerate() {
-                    if task >= current_attempt_start {
+                    let key = (stage_id, stage.stage_attempt_num, task);
+                    if task >= current_attempt_start
+                        && !self.refunded_tasks.contains(&key)
+                        && let task_status::Status::Running(owner) = &info.task_status
+                    {
                         self.retired_vcores.insert(
-                            (stage_id, stage.stage_attempt_num, task),
-                            info.vcores_consumed,
+                            key,
+                            (owner.executor_id.clone(), info.vcores_consumed),
                         );
                     }
                     info.task_status = task_status::Status::Failed(FailedTask {
@@ -2589,6 +2620,102 @@ mod test {
     }
 
     #[tokio::test]
+    async fn pipelined_reports_require_live_task_ownership() -> Result<()> {
+        let mut graph = pipelined_test_graph().await;
+        let executor = mock_executor("owner".into());
+        let task = graph.pop_next_task(&executor.id)?.unwrap();
+        let stage_id = task.key.stage_id;
+        let success = mock_completed_task(task, &executor.id);
+
+        let wrong_executor = mock_executor("another-executor".into());
+        assert_eq!(graph.release_task_vcores(&wrong_executor.id, &success), 0);
+        graph.update_task_status(&wrong_executor, vec![success.clone()], 4, 4)?;
+
+        let mut malformed = success.clone();
+        malformed.status = None;
+        graph.update_task_status(&executor, vec![malformed], 4, 4)?;
+        let mut wrong_payload = success.clone();
+        if let Some(task_status::Status::Successful(ref mut task)) = wrong_payload.status
+        {
+            task.executor_id = wrong_executor.id.clone();
+        }
+        assert_eq!(graph.release_task_vcores(&executor.id, &wrong_payload), 0);
+        graph.update_task_status(&executor, vec![wrong_payload], 4, 4)?;
+        assert!(
+            !graph
+                .shuffle_inputs
+                .lock()
+                .get(&graph.job_id, stage_id)
+                .unwrap()
+                .has_committed_input()
+        );
+
+        assert_eq!(graph.release_task_vcores(&executor.id, &success), 1);
+        graph.update_task_status(&executor, vec![success.clone()], 4, 4)?;
+        assert!(
+            graph
+                .shuffle_inputs
+                .lock()
+                .get(&graph.job_id, stage_id)
+                .unwrap()
+                .has_committed_input()
+        );
+
+        let mut late_failure = success;
+        late_failure.status = Some(task_status::Status::Failed(FailedTask {
+            error: "late duplicate".into(),
+            retryable: false,
+            count_to_failures: true,
+            failed_reason: Some(failed_task::FailedReason::ExecutionError(
+                ExecutionError {},
+            )),
+        }));
+        assert_eq!(graph.release_task_vcores(&executor.id, &late_failure), 0);
+        graph.update_task_status(&executor, vec![late_failure], 4, 4)?;
+        assert!(!matches!(
+            graph.status().status,
+            Some(job_status::Status::Failed(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipelined_duplicate_failures_reschedule_partitions_once() -> Result<()> {
+        let mut graph = pipelined_test_graph().await;
+        let executor = mock_executor("owner".into());
+        let task = graph.pop_next_task(&executor.id)?.unwrap();
+        let stage_id = task.key.stage_id;
+        let task_partitions = task.global_input_partition_ids.clone();
+        let pending = graph.stages[&stage_id].task_infos().unwrap().len();
+        assert_eq!(pending, 1);
+        let failure = mock_failed_task(
+            task,
+            FailedTask {
+                error: "retry once".into(),
+                retryable: true,
+                count_to_failures: true,
+                failed_reason: Some(failed_task::FailedReason::IoError(IoError {})),
+            },
+        );
+        graph.update_task_status(
+            &executor,
+            vec![failure.clone(), failure.clone()],
+            4,
+            4,
+        )?;
+        graph.update_task_status(&executor, vec![failure], 4, 4)?;
+
+        let ExecutionStage::Running(stage) = &graph.stages[&stage_id] else {
+            panic!("producer remains runnable after retryable failure");
+        };
+        assert_eq!(stage.pending.remaining(), stage.pending.total_partitions());
+        for partition in task_partitions {
+            assert_eq!(stage.task_failure_numbers[partition], 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pipelined_repeated_rollbacks_preserve_task_ids_and_refund_once() -> Result<()>
     {
         let mut graph = pipelined_test_graph().await;
@@ -2600,8 +2727,12 @@ mod test {
         let first_status = mock_completed_task(first, "attempt-0");
 
         graph.rollback_running_stage(stage_id, HashSet::new())?;
-        assert_eq!(graph.release_task_vcores(&first_status), 1);
-        assert_eq!(graph.release_task_vcores(&first_status), 0);
+        assert_eq!(
+            graph.release_task_vcores("wrong-executor", &first_status),
+            0
+        );
+        assert_eq!(graph.release_task_vcores("attempt-0", &first_status), 1);
+        assert_eq!(graph.release_task_vcores("attempt-0", &first_status), 0);
 
         graph.resolve_stage(stage_id)?;
         graph.revive();
@@ -2614,17 +2745,20 @@ mod test {
         let second_status = mock_completed_task(second, "attempt-1");
 
         graph.rollback_running_stage(stage_id, HashSet::new())?;
-        assert_eq!(graph.release_task_vcores(&second_status), 1);
-        assert_eq!(graph.release_task_vcores(&second_status), 0);
+        assert_eq!(graph.release_task_vcores("attempt-1", &second_status), 1);
+        assert_eq!(graph.release_task_vcores("attempt-1", &second_status), 0);
         // A very late duplicate from attempt N remains refunded even after N+1
         // has itself been retired.
-        assert_eq!(graph.release_task_vcores(&first_status), 0);
+        assert_eq!(graph.release_task_vcores("attempt-0", &first_status), 0);
         // Old append-only slots are identity reservations, not tasks from the
         // newer attempt. An impossible N+1/task-from-N status must not acquire
         // a synthetic refund entry during the second rollback.
         let mut impossible_identity = first_status.clone();
         impossible_identity.stage_attempt_num = second_attempt as u32;
-        assert_eq!(graph.release_task_vcores(&impossible_identity), 0);
+        assert_eq!(
+            graph.release_task_vcores("attempt-0", &impossible_identity),
+            0
+        );
         assert!(!graph.retired_vcores.contains_key(&(
             stage_id,
             second_attempt,

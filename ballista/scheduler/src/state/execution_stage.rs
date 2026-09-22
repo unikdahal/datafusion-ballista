@@ -865,6 +865,39 @@ impl RunningStage {
         self.pending.remaining()
     }
 
+    /// Only the executor owning a live task may advance its status. Terminal
+    /// slots are append-only history: duplicate failures must not enqueue the
+    /// same partitions again, and late successes must not publish stale data.
+    pub(crate) fn accepts_status_from(
+        &self,
+        executor_id: &str,
+        status: &TaskStatus,
+    ) -> bool {
+        if status.stage_id as usize != self.stage_id
+            || status.stage_attempt_num as usize != self.stage_attempt_num
+        {
+            return false;
+        }
+        let Some(info) = self.task_infos.get(status.task_id as usize) else {
+            return false;
+        };
+        if !matches!(&info.task_status,
+            task_status::Status::Running(owner) if owner.executor_id == executor_id)
+        {
+            return false;
+        }
+        match &status.status {
+            Some(task_status::Status::Successful(success)) => {
+                success.executor_id == executor_id
+            }
+            Some(task_status::Status::Running(running)) => {
+                running.executor_id == executor_id
+            }
+            Some(task_status::Status::Failed(_)) => true,
+            None => false,
+        }
+    }
+
     /// Check whether a task status may still be accepted without mutating the
     /// running stage. Pipelined shuffle publication uses this before preparing
     /// a registry commit so a rejected late status can never publish data.
