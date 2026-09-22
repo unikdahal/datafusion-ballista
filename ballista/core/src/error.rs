@@ -71,6 +71,8 @@ pub enum BallistaError {
         expected: u64,
         current: u64,
     },
+    /// A pipelined consumer must stop because producer work reopened.
+    TailAdmissionRevoked { stage_id: usize },
     /// Operation was cancelled.
     Cancelled,
 }
@@ -219,6 +221,9 @@ impl Display for BallistaError {
                 )
             }
             BallistaError::Cancelled => write!(f, "Task cancelled"),
+            BallistaError::TailAdmissionRevoked { stage_id } => {
+                write!(f, "Tail admission revoked for producer {stage_id}")
+            }
             BallistaError::ShuffleGenerationInvalidated {
                 stage_id,
                 expected,
@@ -263,6 +268,83 @@ fn find_fetch_failed(e: &BallistaError) -> Option<FetchFailedDetails> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PipelinedRecoveryFailure {
+    TailAdmissionRevoked {
+        stage_id: usize,
+    },
+    ShuffleGenerationInvalidated {
+        stage_id: usize,
+        expected: u64,
+        current: u64,
+    },
+}
+
+impl PipelinedRecoveryFailure {
+    fn into_failed_task(self) -> FailedTask {
+        match self {
+            Self::TailAdmissionRevoked { stage_id } => FailedTask {
+                error: format!("Tail admission revoked for producer {stage_id}"),
+                retryable: true,
+                count_to_failures: false,
+                failed_reason: Some(FailedReason::TailAdmissionRevoked(
+                    crate::serde::protobuf::TailAdmissionRevoked {
+                        stage_id: stage_id as u32,
+                    },
+                )),
+            },
+            Self::ShuffleGenerationInvalidated {
+                stage_id,
+                expected,
+                current,
+            } => FailedTask {
+                error: format!(
+                    "Shuffle stage {stage_id}: generation {expected} invalidated by {current}"
+                ),
+                retryable: true,
+                count_to_failures: false,
+                failed_reason: Some(FailedReason::ShuffleInputInvalidated(
+                    crate::serde::protobuf::ShuffleInputInvalidated {
+                        stage_id: stage_id as u32,
+                        expected_generation: expected,
+                        current_generation: current,
+                    },
+                )),
+            },
+        }
+    }
+}
+
+/// Recovery control failures are emitted from execution plans as
+/// DataFusionError::External and may be wrapped by operators in Shared/Context.
+/// Preserve their structural identity through those wrappers so the scheduler
+/// retries/revokes the stage instead of misclassifying them as ExecutionError.
+fn find_pipelined_recovery(e: &BallistaError) -> Option<PipelinedRecoveryFailure> {
+    match e {
+        BallistaError::TailAdmissionRevoked { stage_id } => {
+            Some(PipelinedRecoveryFailure::TailAdmissionRevoked {
+                stage_id: *stage_id,
+            })
+        }
+        BallistaError::ShuffleGenerationInvalidated {
+            stage_id,
+            expected,
+            current,
+        } => Some(PipelinedRecoveryFailure::ShuffleGenerationInvalidated {
+            stage_id: *stage_id,
+            expected: *expected,
+            current: *current,
+        }),
+        BallistaError::DataFusionError(e) => match e.find_root() {
+            DataFusionError::External(inner) => inner
+                .downcast_ref::<BallistaError>()
+                .and_then(find_pipelined_recovery),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether the error is a retryable IO failure, native or carried across
 /// DataFusion under any wrapper layer.
 fn is_retryable_io(e: &BallistaError) -> bool {
@@ -294,6 +376,9 @@ impl From<BallistaError> for FailedTask {
                     },
                 )),
             };
+        }
+        if let Some(recovery) = find_pipelined_recovery(&e) {
+            return recovery.into_failed_task();
         }
         match e {
             BallistaError::Cancelled => FailedTask {
@@ -413,6 +498,63 @@ mod tests {
             task.failed_reason,
             Some(FailedReason::TaskKilled(_))
         ));
+    }
+
+    #[test]
+    fn pipelined_recovery_errors_survive_datafusion_wrappers() {
+        let tail_cases = [
+            BallistaError::TailAdmissionRevoked { stage_id: 7 },
+            wrap_in_shared_external(BallistaError::TailAdmissionRevoked {
+                stage_id: 7,
+            }),
+            wrap_in_context_external(BallistaError::TailAdmissionRevoked {
+                stage_id: 7,
+            }),
+        ];
+        for error in tail_cases {
+            let task = FailedTask::from(error);
+            assert!(task.retryable);
+            assert!(!task.count_to_failures);
+            assert!(matches!(
+                task.failed_reason,
+                Some(FailedReason::TailAdmissionRevoked(
+                    crate::serde::protobuf::TailAdmissionRevoked { stage_id: 7 }
+                ))
+            ));
+        }
+
+        let invalidation_cases = [
+            BallistaError::ShuffleGenerationInvalidated {
+                stage_id: 3,
+                expected: 4,
+                current: 5,
+            },
+            wrap_in_shared_external(BallistaError::ShuffleGenerationInvalidated {
+                stage_id: 3,
+                expected: 4,
+                current: 5,
+            }),
+            wrap_in_context_external(BallistaError::ShuffleGenerationInvalidated {
+                stage_id: 3,
+                expected: 4,
+                current: 5,
+            }),
+        ];
+        for error in invalidation_cases {
+            let task = FailedTask::from(error);
+            assert!(task.retryable);
+            assert!(!task.count_to_failures);
+            assert!(matches!(
+                task.failed_reason,
+                Some(FailedReason::ShuffleInputInvalidated(
+                    crate::serde::protobuf::ShuffleInputInvalidated {
+                        stage_id: 3,
+                        expected_generation: 4,
+                        current_generation: 5,
+                    }
+                ))
+            ));
+        }
     }
 
     #[test]

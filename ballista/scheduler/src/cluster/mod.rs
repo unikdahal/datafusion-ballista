@@ -688,6 +688,42 @@ mod test {
     use datafusion::prelude::SessionConfig;
 
     #[tokio::test]
+    async fn pipelined_fresh_graph_binds_source_work_without_manual_revive() -> Result<()> {
+        let job_id = JobId::from("fresh-pipelined-job");
+        let session_config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .with_ballista_adaptive_query_planner(false)
+                .with_ballista_shuffle_pipelined_enabled(true)
+                .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "0"),
+        );
+        let graph = test_aggregation_plan_with_config(4, &job_id, session_config).await;
+        assert!(
+            graph.running_stages().is_empty(),
+            "regression requires a genuinely fresh graph"
+        );
+
+        let mut active_jobs = HashMap::new();
+        active_jobs.insert(job_id.clone(), JobInfoCache::new(Box::new(graph)));
+        let mut budgets = vec![AvailableVcores {
+            executor_id: "executor_0".to_string(),
+            vcores: 4,
+        }];
+        let bound = bind_task_bias(
+            budgets.iter_mut().collect(),
+            Arc::new(active_jobs),
+            |_| false,
+        )
+        .await;
+
+        assert!(
+            !bound.is_empty(),
+            "normal admission must revive a resolved source stage before tail scheduling"
+        );
+        assert!(bound.iter().all(|(_, task)| task.key.job_id == job_id));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_bind_task_bias() -> Result<()> {
         let num_partition = 8usize;
         let active_jobs = mock_active_jobs(num_partition).await?;

@@ -37,7 +37,8 @@ use ballista_api_types::dto::{
     QueryStagesResponse, TaskStatus, TaskSummary,
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason::{
-    ExecutionError, ExecutorLost, FetchPartitionError, IoError, ResultLost, TaskKilled,
+    ExecutionError, ExecutorLost, FetchPartitionError, IoError, ResultLost,
+    ShuffleInputInvalidated, TailAdmissionRevoked, TaskKilled,
 };
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{FailedTask, OperatorMetricsSet, task_status};
@@ -419,6 +420,8 @@ fn failed_reason(failed: &FailedTask) -> String {
         Some(IoError(_)) => "IoError",
         Some(ExecutorLost(_)) => "ExecutorLost",
         Some(ResultLost(_)) => "ResultLost",
+        Some(ShuffleInputInvalidated(_)) => "ShuffleInputInvalidated",
+        Some(TailAdmissionRevoked(_)) => "TailAdmissionRevoked",
         Some(TaskKilled(_)) => "TaskKilled",
         None => "Failed",
     }

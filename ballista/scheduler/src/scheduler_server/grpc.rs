@@ -852,6 +852,9 @@ fn shuffle_poll_wait(max_wait_ms: u32) -> std::time::Duration {
 
 async fn poll_shuffle_input_registry(
     registry: Arc<parking_lot::Mutex<crate::state::shuffle_input::ShuffleInputRegistry>>,
+    graph: Option<
+        Arc<tokio::sync::RwLock<crate::state::execution_graph::ExecutionGraphBox>>,
+    >,
     job: ballista_core::JobId,
     stage: usize,
     generation: u64,
@@ -900,6 +903,21 @@ async fn poll_shuffle_input_registry(
                 )));
             }
             ShuffleInputRead::Update(update) => {
+                // ABORTED is reserved for admission revocation. Keeping the
+                // graph handle optional lets registry-only unit tests exercise
+                // the protocol without constructing an execution graph.
+                if update.lifecycle == ShuffleInputLifecycle::Producing
+                    && let Some(graph) = &graph
+                {
+                    let graph = graph.read().await;
+                    if matches!(
+                        graph.stages().get(&stage),
+                        Some(crate::state::execution_stage::ExecutionStage::Running(producer))
+                            if !producer.pending.is_empty()
+                    ) {
+                        return Err(Status::aborted("producer work reopened"));
+                    }
+                }
                 if update.version == after
                     && update.lifecycle == ShuffleInputLifecycle::Producing
                     && tokio::time::Instant::now() < deadline
@@ -970,6 +988,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
         poll_shuffle_input_registry(
             registry,
+            Some(graph),
             job,
             stage,
             handle.generation,
@@ -1155,10 +1174,18 @@ mod test {
         let registry = Arc::new(parking_lot::Mutex::new(ShuffleInputRegistry::default()));
         registry.lock().create(&job, 1);
 
-        let error =
-            poll_shuffle_input_registry(registry, job, 1, 1, 1, HashSet::from([0]), 0)
-                .await
-                .unwrap_err();
+        let error = poll_shuffle_input_registry(
+            registry,
+            None,
+            job,
+            1,
+            1,
+            1,
+            HashSet::from([0]),
+            0,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
@@ -1170,6 +1197,7 @@ mod test {
 
         let waiter = tokio::spawn(poll_shuffle_input_registry(
             registry.clone(),
+            None,
             job.clone(),
             1,
             1,
@@ -1210,6 +1238,7 @@ mod test {
 
         let waiter = tokio::spawn(poll_shuffle_input_registry(
             registry.clone(),
+            None,
             job.clone(),
             1,
             1,
@@ -1235,22 +1264,25 @@ mod test {
         let registry = Arc::new(parking_lot::Mutex::new(ShuffleInputRegistry::default()));
         registry.lock().create(&job, 1);
 
+        let block = shuffle_location(&job, 0, 0);
+        registry
+            .lock()
+            .commit(&job, 1, 1, 0, vec![block.clone()])
+            .unwrap();
+
         let waiter = tokio::spawn(poll_shuffle_input_registry(
             registry.clone(),
+            None,
             job.clone(),
             1,
             1,
-            0,
+            1,
             HashSet::from([0]),
             30_000,
         ));
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let lost = HashSet::from([ShuffleBlockKey {
-            producer_task_id: 0,
-            output_partition_id: 0,
-            file_id: None,
-        }]);
+        let lost = HashSet::from([ShuffleBlockKey::from(&block)]);
         registry.lock().invalidate(&job, 1, 1, &lost).unwrap();
 
         let response = tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -1276,10 +1308,18 @@ mod test {
         let registry = Arc::new(parking_lot::Mutex::new(ShuffleInputRegistry::default()));
         registry.lock().create(&job, 1);
 
-        let response =
-            poll_shuffle_input_registry(registry, job, 1, 1, 0, HashSet::from([0]), 1)
-                .await
-                .expect("timeout should return the current snapshot");
+        let response = poll_shuffle_input_registry(
+            registry,
+            None,
+            job,
+            1,
+            1,
+            0,
+            HashSet::from([0]),
+            1,
+        )
+        .await
+        .expect("timeout should return the current snapshot");
         let result = response.result.expect("shuffle result");
         match result {
             ballista_core::serde::protobuf::shuffle_input_result::Result::Update(

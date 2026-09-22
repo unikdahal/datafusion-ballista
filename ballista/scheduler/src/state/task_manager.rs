@@ -529,13 +529,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let Some(graph_arc) = self.get_active_execution_graph(&job_id.into()) else {
                 continue;
             };
-            let graph = graph_arc.read().await;
+            let mut graph = graph_arc.write().await;
             for status in job_statuses {
-                if let Some(vcores) =
-                    graph.task_vcores(status.stage_id as usize, status.task_id as usize)
-                {
-                    total_vcores += vcores;
-                }
+                total_vcores += graph.release_task_vcores(status);
             }
         }
         total_vcores
