@@ -606,7 +606,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 "Failed to persist terminal state for job {job_id}; evicting the local cache entry: {error}"
             );
         }
-        let _ = self.remove_active_execution_graph(job_id);
+        let _ = self.remove_active_execution_graph(job_id).await;
         save_result
     }
 
@@ -928,14 +928,22 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             .map(|cached| cached.execution_graph.clone())
     }
 
-    /// Remove the `ExecutionGraph` for the given job ID from cache
-    pub(crate) fn remove_active_execution_graph(
+    /// Remove the `ExecutionGraph` for the given job ID from cache.
+    ///
+    /// Capture the graph-owned shuffle registry before eviction so that, once
+    /// the cache entry is removed, closing it and waking long-poll waiters is
+    /// synchronous and cannot be lost to cancellation of a detached task.
+    pub(crate) async fn remove_active_execution_graph(
         &self,
         job_id: &JobId,
     ) -> Option<Arc<RwLock<ExecutionGraphBox>>> {
-        self.active_job_cache
-            .remove(job_id)
-            .map(|value| value.1.execution_graph)
+        let graph = self.get_active_execution_graph(job_id)?;
+        let shuffle_inputs = graph.read().await.shuffle_inputs();
+        let removed = self.active_job_cache.remove(job_id)?;
+        if let Some(registry) = shuffle_inputs {
+            registry.lock().close_job(job_id);
+        }
+        Some(removed.1.execution_graph)
     }
 
     /// Clean up a failed job in FailedJobs Keyspace by delayed clean_up_interval seconds

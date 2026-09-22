@@ -105,6 +105,13 @@ pub type ExecutionGraphBox = Box<dyn ExecutionGraph + Send + Sync>;
 /// If a stage has `output_links` is empty then it is the final stage in this query, and it should
 /// publish its outputs to the `ExecutionGraph`s `output_locations` representing the final query results.
 pub trait ExecutionGraph: Debug {
+    /// Runtime metadata is absent for graph implementations without pipelining.
+    fn shuffle_inputs(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>> {
+        None
+    }
+
     /// Returns the job ID for this execution graph.
     fn job_id(&self) -> &JobId;
 
@@ -283,6 +290,7 @@ pub trait ExecutionGraph: Debug {
 /// all stages on job submission time
 #[derive(Clone)]
 pub struct StaticExecutionGraph {
+    shuffle_inputs: Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>,
     /// Curator scheduler name. Can be `None` is `ExecutionGraph` is not currently curated by any scheduler
     #[allow(dead_code)] // not used at the moment, will be used later
     scheduler_id: Option<String>,
@@ -358,6 +366,7 @@ impl StaticExecutionGraph {
         let started_at = timestamp_millis();
 
         Ok(Self {
+            shuffle_inputs: Arc::new(parking_lot::Mutex::new(Default::default())),
             scheduler_id: Some(scheduler_id.to_string()),
             job_id: job_id.to_owned(),
             job_name: job_name.to_owned(),
@@ -659,6 +668,11 @@ impl StaticExecutionGraph {
 }
 
 impl ExecutionGraph for StaticExecutionGraph {
+    fn shuffle_inputs(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>> {
+        Some(self.shuffle_inputs.clone())
+    }
     fn cloned(&self) -> ExecutionGraphBox {
         Box::new(self.clone())
     }
