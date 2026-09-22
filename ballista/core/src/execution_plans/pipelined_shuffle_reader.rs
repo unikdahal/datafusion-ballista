@@ -1013,4 +1013,3 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
         )))
     }
 }
-
