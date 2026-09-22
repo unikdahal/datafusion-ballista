@@ -61,6 +61,12 @@ use crate::state::task_manager::UpdatedStages;
 /// Boxed [ExecutionGraph]
 pub type ExecutionGraphBox = Box<dyn ExecutionGraph + Send + Sync>;
 
+// Tail scheduling is not safe to expose until generation invalidation and
+// consumer revocation land in the recovery layer. Unit tests intentionally
+// exercise the admission machinery in this intermediate stack layer; the
+// recovery PR flips this constant to true for production builds.
+const PIPELINED_SHUFFLE_RECOVERY_READY: bool = cfg!(test);
+
 /// Represents the DAG for a distributed query plan.
 ///
 /// A distributed query plan consists of a set of stages which must be executed sequentially.
@@ -177,6 +183,19 @@ pub trait ExecutionGraph: Debug {
     /// generator is needed.
     fn fetch_running_stage(&mut self, black_list: &[usize]) -> Option<&mut RunningStage>;
 
+    /// Normal work is bound across all jobs before revocable producer-tail work.
+    fn fetch_running_stage_for_admission(
+        &mut self,
+        black_list: &[usize],
+        tail: bool,
+    ) -> Option<&mut RunningStage> {
+        if tail {
+            None
+        } else {
+            self.fetch_running_stage(black_list)
+        }
+    }
+
     /// Updates the job status.
     fn update_status(&mut self, status: JobStatus);
 
@@ -292,6 +311,11 @@ pub trait ExecutionGraph: Debug {
 #[derive(Clone)]
 pub struct StaticExecutionGraph {
     shuffle_inputs: Arc<parking_lot::Mutex<super::shuffle_input::ShuffleInputRegistry>>,
+    /// A deterministic pipelined-plan rewrite failure disables further tail
+    /// plan construction for this job. Existing valid tail stages retain their
+    /// explicit admission semantics while unresolved consumers fall back to
+    /// the blocking barrier.
+    pipelined_resolution_error: Option<String>,
     /// Curator scheduler name. Can be `None` is `ExecutionGraph` is not currently curated by any scheduler
     #[allow(dead_code)] // not used at the moment, will be used later
     scheduler_id: Option<String>,
@@ -374,8 +398,111 @@ fn pipelined_plan_eligible(plan: &dyn ExecutionPlan) -> bool {
 }
 
 impl StaticExecutionGraph {
+    /// Check whether every pinned producer history is safe for this admission.
+    ///
+    /// Atomicity relies on the caller holding the execution graph's exclusive
+    /// write guard while this method observes both registry history and each
+    /// producer's pending queue. The registry mutex alone is not sufficient:
+    /// task-status processing mutates the history and stage state together.
+    /// Keep this helper private unless that locking contract is preserved.
+    fn input_histories_ready(
+        &self,
+        handles: &[ballista_core::serde::protobuf::ShuffleInputHandle],
+        require_sealed: bool,
+    ) -> bool {
+        use super::shuffle_input::ShuffleInputLifecycle;
+        let registry = self.shuffle_inputs.lock();
+        handles.iter().all(|handle| {
+            let Some(state) = registry.get(&self.job_id, handle.stage_id as usize) else {
+                return false;
+            };
+            if state.generation() != handle.generation {
+                return false;
+            }
+            if state.lifecycle() == ShuffleInputLifecycle::Sealed {
+                return true;
+            }
+            if require_sealed || !state.has_committed_input() {
+                return false;
+            }
+            matches!(
+                self.stages.get(&(handle.stage_id as usize)),
+                Some(ExecutionStage::Running(producer)) if producer.pending.is_empty()
+            )
+        })
+    }
+
+    /// Resolve all currently eligible tail consumers. No candidate is a normal
+    /// temporary state and returns Ok(()); an Err means plan construction
+    /// itself failed and is therefore deterministic for this graph state.
+    fn resolve_tail_stages(&mut self) -> Result<()> {
+        let candidates: Vec<_> = self
+            .stages
+            .iter()
+            .filter_map(|(id, stage)| {
+                let ExecutionStage::UnResolved(stage) = stage else {
+                    return None;
+                };
+                if stage.resolvable() {
+                    return None;
+                }
+                let handles = self.pipelined_handles(stage)?;
+                let input_refs: Vec<_> = handles.values().cloned().collect();
+                self.input_histories_ready(&input_refs, false)
+                    .then_some((*id, handles))
+            })
+            .collect();
+
+        // Build every replacement before mutating the graph. A deterministic
+        // rewrite failure must not leave a prefix of candidates converted to
+        // tail stages while the caller believes tail construction failed.
+        let mut resolved = Vec::with_capacity(candidates.len());
+        for (id, handles) in candidates {
+            let Some(ExecutionStage::UnResolved(stage)) = self.stages.get(&id) else {
+                continue;
+            };
+            resolved.push((id, stage.to_pipelined_resolved(&handles)?.to_running()));
+        }
+        for (id, stage) in resolved {
+            self.stages.insert(id, ExecutionStage::Running(stage));
+        }
+        Ok(())
+    }
+
+    fn running_stage_for_admission_id(
+        &self,
+        black_list: &[usize],
+        tail: bool,
+    ) -> Option<usize> {
+        use super::execution_stage::StageAdmission;
+
+        self.stages
+            .iter()
+            .filter_map(|(id, stage)| {
+                let ExecutionStage::Running(stage) = stage else {
+                    return None;
+                };
+                if black_list.contains(id) || stage.pending.is_empty() {
+                    return None;
+                }
+                let eligible = match &stage.admission {
+                    StageAdmission::Normal => !tail,
+                    StageAdmission::TailPipelined(inputs) => {
+                        if self.input_histories_ready(inputs, true) {
+                            !tail
+                        } else {
+                            tail && self.input_histories_ready(inputs, false)
+                        }
+                    }
+                };
+                eligible.then_some(*id)
+            })
+            .min()
+    }
+
     fn pipelining_enabled(&self) -> bool {
-        self.session_config.ballista_shuffle_pipelined_enabled()
+        PIPELINED_SHUFFLE_RECOVERY_READY
+            && self.session_config.ballista_shuffle_pipelined_enabled()
             && !self
                 .session_config
                 .ballista_adaptive_query_planner_enabled()
@@ -442,7 +569,12 @@ impl StaticExecutionGraph {
             session_config.ballista_shuffle_pipelined_enabled();
         let adaptive_enabled =
             session_config.ballista_adaptive_query_planner_enabled();
-        if pipelining_requested && adaptive_enabled {
+        if pipelining_requested && !PIPELINED_SHUFFLE_RECOVERY_READY {
+            warn!(
+                "ballista.shuffle.pipelined.enabled=true is unavailable in this build; \
+                 the recovery layer must be included before tail scheduling can be enabled"
+            );
+        } else if pipelining_requested && adaptive_enabled {
             warn!(
                 "ballista.shuffle.pipelined.enabled=true is ignored because \
                  ballista.planner.adaptive.enabled=true; disable adaptive planning \
@@ -451,7 +583,7 @@ impl StaticExecutionGraph {
         }
 
         let mut shuffle_inputs = super::shuffle_input::ShuffleInputRegistry::default();
-        if pipelining_requested && !adaptive_enabled {
+        if PIPELINED_SHUFFLE_RECOVERY_READY && pipelining_requested && !adaptive_enabled {
             for stage_id in stages.keys() {
                 shuffle_inputs.create(job_id, *stage_id);
             }
@@ -461,6 +593,7 @@ impl StaticExecutionGraph {
 
         Ok(Self {
             shuffle_inputs: Arc::new(parking_lot::Mutex::new(shuffle_inputs)),
+            pipelined_resolution_error: None,
             scheduler_id: Some(scheduler_id.to_string()),
             job_id: job_id.to_owned(),
             job_name: job_name.to_owned(),
@@ -586,6 +719,38 @@ impl StaticExecutionGraph {
                         // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
                         if linked_unresolved_stage.resolvable() {
                             resolved_stages.push(linked_unresolved_stage.stage_id);
+                        }
+                    } else if let ExecutionStage::Running(stage) = linked_stage
+                        && matches!(
+                            stage.admission,
+                            super::execution_stage::StageAdmission::TailPipelined(_)
+                        )
+                    {
+                        if let Some(input) = stage.inputs.get_mut(&stage_id) {
+                            for location in locations.iter().cloned() {
+                                input
+                                    .partition_locations
+                                    .entry(location.partition_id.partition_id)
+                                    .or_default()
+                                    .push(location);
+                            }
+                            input.complete = is_completed;
+                        }
+                    } else if let ExecutionStage::Resolved(stage) = linked_stage
+                        && matches!(
+                            stage.admission,
+                            super::execution_stage::StageAdmission::TailPipelined(_)
+                        )
+                    {
+                        if let Some(input) = stage.inputs.get_mut(&stage_id) {
+                            for location in locations.iter().cloned() {
+                                input
+                                    .partition_locations
+                                    .entry(location.partition_id.partition_id)
+                                    .or_default()
+                                    .push(location);
+                            }
+                            input.complete = is_completed;
                         }
                     } else {
                         return Err(BallistaError::Internal(format!(
@@ -1468,6 +1633,51 @@ impl ExecutionGraph for StaticExecutionGraph {
             }
         } else {
             None
+        }
+    }
+
+    fn fetch_running_stage_for_admission(
+        &mut self,
+        black_list: &[usize],
+        tail: bool,
+    ) -> Option<&mut RunningStage> {
+        if !self.pipelining_enabled() {
+            return if tail {
+                None
+            } else {
+                self.fetch_running_stage(black_list)
+            };
+        }
+        if !matches!(self.status.status, Some(job_status::Status::Running(_))) {
+            return None;
+        }
+        if tail
+            && self.pipelined_resolution_error.is_none()
+            && let Err(err) = self.resolve_tail_stages()
+        {
+            let message = err.to_string();
+            error!(
+                "Job {}: deterministic pipelined shuffle plan construction failed; \
+                 disabling further tail plan construction for this job and falling back to the blocking barrier: {}",
+                self.job_id, message
+            );
+            self.pipelined_resolution_error = Some(message);
+            return None;
+        }
+
+        let mut selected = self.running_stage_for_admission_id(black_list, tail);
+
+        // Preserve the legacy scheduler's liveness transition: a fresh graph
+        // starts with source stages in Resolved state, and normal scheduling is
+        // responsible for reviving them before the first task can be bound.
+        // Tail admission never revives stages on its own.
+        if selected.is_none() && !tail && self.revive() {
+            selected = self.running_stage_for_admission_id(black_list, false);
+        }
+
+        match selected.and_then(|id| self.stages.get_mut(&id)) {
+            Some(ExecutionStage::Running(stage)) => Some(stage),
+            _ => None,
         }
     }
 

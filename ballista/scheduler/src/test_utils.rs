@@ -1014,6 +1014,24 @@ pub async fn test_aggregation_plan_with_config(
 
 /// Creates a test execution graph with two nested aggregations.
 pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGraph {
+    test_two_aggregations_plan_with_config(
+        partition,
+        &"job".into(),
+        Arc::new(SessionConfig::new_with_ballista()),
+    )
+    .await
+}
+
+/// Same nested-aggregation topology with caller-controlled job/config.
+///
+/// Unlike the simple aggregation fixture, this produces an intermediate
+/// consumer stage (non-empty inputs and output links), so it can exercise
+/// tail-pipelined admission without relaxing the final-stage barrier.
+pub async fn test_two_aggregations_plan_with_config(
+    partition: usize,
+    job_id: &JobId,
+    session_config: Arc<SessionConfig>,
+) -> StaticExecutionGraph {
     let config = SessionConfig::new().with_target_partitions(partition);
     let ctx = Arc::new(SessionContext::new_with_config(config));
     let session_state = ctx.state();
@@ -1024,7 +1042,8 @@ pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGrap
         Field::new("gmv", DataType::UInt64, false),
     ]);
 
-    // we specify the input partitions to be > 1 because of https://github.com/apache/datafusion/issues/12611
+    // Keep multiple source partitions so binder tests can distinguish
+    // committed output from producer pending being fully assigned.
     let logical_plan = scan_empty_with_partitions(None, &schema, Some(vec![0, 1, 2]), 2)
         .unwrap()
         .aggregate(vec![col("id"), col("name")], vec![sum(col("gmv"))])
@@ -1049,12 +1068,12 @@ pub async fn test_two_aggregations_plan(partition: usize) -> StaticExecutionGrap
 
     StaticExecutionGraph::new(
         "localhost:50050",
-        &"job".into(),
+        job_id,
         "",
         "session",
         plan,
         0,
-        Arc::new(SessionConfig::new_with_ballista()),
+        session_config,
         &mut planner,
         None,
     )
