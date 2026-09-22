@@ -84,8 +84,10 @@ pub struct ShuffleInputSnapshot {
 
 /// Result of reading a generation-pinned shuffle input.
 ///
-/// A generation mismatch terminates the old consumer attempt; consumers must
-/// never silently switch to the new generation.
+/// A request pinned to an older generation terminates that consumer attempt;
+/// consumers must never silently switch to the new generation. A request for a
+/// future generation is invalid and fails closed rather than masquerading as
+/// ordinary invalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShuffleInputRead {
     /// Current state and locations newer than the supplied cursor.
@@ -144,9 +146,16 @@ impl ShuffleGenerationState {
 
 /// Scheduler-owned registry for generation-pinned committed shuffle metadata.
 ///
-/// Mutations are serialized by scheduler ownership. Callers must never hold the
-/// registry lock while awaiting a notification. Register the notification
-/// before reading state to avoid lost wakeups.
+/// Mutations are serialized by scheduler ownership. Within one generation,
+/// producer_task_id is a single-success identity: a distinct task attempt must
+/// never reuse an already accepted task ID. Exact replay of the same publication
+/// is allowed; a different publication for that ID fails closed.
+///
+/// Callers must never hold the registry lock while awaiting a notification.
+/// Because Notify::notify_waiters stores no permit, a waiter must create, pin,
+/// and enable its Notified future before reading registry state, then release
+/// the registry lock before awaiting it. Merely creating the future before the
+/// read is not sufficient to prevent a lost wakeup.
 #[derive(Debug, Default)]
 pub struct ShuffleInputRegistry {
     inputs: HashMap<(JobId, usize), ShuffleGenerationState>,
@@ -178,6 +187,10 @@ impl ShuffleInputRegistry {
     /// set, including an empty set. A later publication for the same task and
     /// generation must be exactly equal modulo ordering; otherwise it fails
     /// closed. Exact replay never advances the version.
+    ///
+    /// task is a generation-local single-success identity. Callers must not
+    /// reuse it for a distinct task attempt while that generation remains
+    /// current.
     pub fn commit(
         &mut self,
         job: &JobId,
@@ -261,10 +274,15 @@ impl ShuffleInputRegistry {
         lost: &HashSet<ShuffleBlockKey>,
     ) -> Result<u64> {
         let state = self.current_mut(job, stage, generation)?;
-        let lost_tasks: HashSet<_> = lost.iter().map(|key| key.producer_task_id).collect();
-        if lost_tasks.is_empty() {
+        if lost.is_empty() {
             return Ok(state.generation);
         }
+        if lost.iter().any(|key| !state.blocks.contains_key(key)) {
+            return Err(invariant(
+                "lost shuffle artifact is not committed in current generation",
+            ));
+        }
+        let lost_tasks: HashSet<_> = lost.iter().map(|key| key.producer_task_id).collect();
 
         let next = increment(state.generation)?;
         state
@@ -314,11 +332,14 @@ impl ShuffleInputRegistry {
         let Some(state) = self.get(job, stage) else {
             return Ok(ShuffleInputRead::Closed);
         };
-        if generation != state.generation {
+        if generation < state.generation {
             return Ok(ShuffleInputRead::Invalidated {
                 expected: generation,
                 current: state.generation,
             });
+        }
+        if generation > state.generation {
+            return Err(invariant("shuffle generation is ahead of the producer"));
         }
         if after > state.version {
             return Err(invariant("shuffle cursor is ahead of the producer"));
@@ -596,6 +617,80 @@ mod tests {
         // task may publish a fresh complete result in the new generation.
         assert_eq!(registry.commit(&job, 1, 2, 1, task_one)?, 1);
         assert_eq!(registry.commit(&job, 1, 2, 0, task_zero)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn task_id_cannot_be_reused_for_a_distinct_success_in_one_generation() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+
+        let first = location(0, 0);
+        assert_eq!(registry.commit(&job, 1, 1, 0, vec![first.clone()])?, 1);
+
+        let mut distinct_attempt = first;
+        distinct_attempt.file_id = Some(99);
+        distinct_attempt.executor_meta.id = "retry-executor".into();
+        assert!(
+            registry
+                .commit(&job, 1, 1, 0, vec![distinct_attempt])
+                .is_err()
+        );
+
+        let state = registry.get(&job, 1).unwrap();
+        assert_eq!(state.generation(), 1);
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.accepted_tasks.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidation_rejects_unknown_artifact_without_mutation() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+
+        let block = location(0, 0);
+        registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
+
+        let mut unknown = ShuffleBlockKey::from(&block);
+        unknown.output_partition_id = 99;
+        assert!(
+            registry
+                .invalidate(&job, 1, 1, &HashSet::from([unknown]))
+                .is_err()
+        );
+
+        let state = registry.get(&job, 1).unwrap();
+        assert_eq!(state.generation(), 1);
+        assert_eq!(state.lifecycle(), ShuffleInputLifecycle::Producing);
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.accepted_tasks.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn future_generation_read_fails_closed() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+
+        assert!(registry.read(&job, 1, 2, 0, &[0]).is_err());
+
+        let block = location(0, 0);
+        registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
+        let lost = HashSet::from([ShuffleBlockKey::from(&block)]);
+        assert_eq!(registry.invalidate(&job, 1, 1, &lost)?, 2);
+
+        assert!(matches!(
+            registry.read(&job, 1, 1, 0, &[0])?,
+            ShuffleInputRead::Invalidated {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert!(registry.read(&job, 1, 3, 0, &[0]).is_err());
         Ok(())
     }
 
