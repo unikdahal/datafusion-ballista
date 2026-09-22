@@ -980,19 +980,17 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
         // current batch of locations to finish. The metadata future lives in
         // the returned stream state (no detached task), so dropping the reader
         // still cancels an in-flight Open/PollShuffleInput request.
-        type MetadataFuture =
-            BoxFuture<'static, Result<pb::ShuffleInputResult>>;
+        type MetadataFuture = BoxFuture<'static, Result<pb::ShuffleInputResult>>;
 
         let metadata_runtime = runtime.clone();
         let metadata_handle = reader.handle.clone();
-        let metadata_poller: Arc<
-            dyn Fn(Option<u64>) -> MetadataFuture + Send + Sync,
-        > = Arc::new(move |after| {
-            let runtime = metadata_runtime.clone();
-            let handle = metadata_handle.clone();
-            let polls = polls.clone();
-            let wait = wait.clone();
-            async move {
+        let metadata_poller: Arc<dyn Fn(Option<u64>) -> MetadataFuture + Send + Sync> =
+            Arc::new(move |after| {
+                let runtime = metadata_runtime.clone();
+                let handle = metadata_handle.clone();
+                let polls = polls.clone();
+                let wait = wait.clone();
+                async move {
                 let mut failures = 0;
                 loop {
                     polls.add(1);
@@ -1048,9 +1046,9 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                         }
                     }
                 }
-            }
-            .boxed()
-        });
+                }
+                .boxed()
+            });
 
         struct ReaderState {
             poll: Option<MetadataFuture>,
@@ -1110,13 +1108,14 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
 
                         enum Next {
                             Metadata(Result<pb::ShuffleInputResult>),
-                            Batch(Option<Result<datafusion::arrow::record_batch::RecordBatch>>),
+                            Batch(
+                                Option<
+                                    Result<datafusion::arrow::record_batch::RecordBatch>,
+                                >,
+                            ),
                         }
 
-                        let next = match (
-                            state.poll.as_mut(),
-                            state.current.as_mut(),
-                        ) {
+                        let next = match (state.poll.as_mut(), state.current.as_mut()) {
                             (Some(poll), Some(fetch)) => {
                                 tokio::select! {
                                     biased;
@@ -1124,16 +1123,11 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                     batch = fetch.next() => Next::Batch(batch),
                                 }
                             }
-                            (Some(poll), None) => {
-                                Next::Metadata(poll.as_mut().await)
-                            }
-                            (None, Some(fetch)) => {
-                                Next::Batch(fetch.next().await)
-                            }
+                            (Some(poll), None) => Next::Metadata(poll.as_mut().await),
+                            (None, Some(fetch)) => Next::Batch(fetch.next().await),
                             (None, None) => {
                                 return Err(DataFusionError::Execution(
-                                    "pipelined shuffle reader made no progress"
-                                        .into(),
+                                    "pipelined shuffle reader made no progress".into(),
                                 ));
                             }
                         };
@@ -1151,11 +1145,9 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                 state.poll = None;
                                 let response = response?;
                                 let update = match response.result {
-                                    Some(
-                                        pb::shuffle_input_result::Result::Update(
-                                            update,
-                                        ),
-                                    ) => update,
+                                    Some(pb::shuffle_input_result::Result::Update(
+                                        update,
+                                    )) => update,
                                     Some(
                                         pb::shuffle_input_result::Result::Invalidated(
                                             invalidated,
@@ -1166,41 +1158,33 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                             || invalidated.current_generation
                                                 <= invalidated.expected_generation
                                         {
-                                            return Err(
-                                                DataFusionError::Execution(
-                                                    "invalid shuffle invalidation history"
-                                                        .into(),
-                                                ),
-                                            );
+                                            return Err(DataFusionError::Execution(
+                                                "invalid shuffle invalidation history"
+                                                    .into(),
+                                            ));
                                         }
                                         invalidations.add(1);
                                         return Err(
                                             BallistaError::ShuffleGenerationInvalidated {
-                                                stage_id: reader.handle.stage_id
-                                                    as usize,
+                                                stage_id: reader.handle.stage_id as usize,
                                                 expected: reader.handle.generation,
-                                                current: invalidated
-                                                    .current_generation,
+                                                current: invalidated.current_generation,
                                             }
                                             .into_datafusion(),
                                         );
                                     }
                                     None => {
                                         return Err(DataFusionError::Execution(
-                                            "missing shuffle metadata result"
-                                                .into(),
+                                            "missing shuffle metadata result".into(),
                                         ));
                                     }
                                 };
 
-                                if update.generation
-                                    != reader.handle.generation
-                                    || update.version
-                                        < state.after.unwrap_or(0)
+                                if update.generation != reader.handle.generation
+                                    || update.version < state.after.unwrap_or(0)
                                     || !matches!(update.lifecycle, 0 | 1)
                                     || (update.lifecycle == 1
-                                        && update.version
-                                            == state.after.unwrap_or(0))
+                                        && update.version == state.after.unwrap_or(0))
                                 {
                                     return Err(DataFusionError::Execution(
                                         "invalid shuffle metadata history".into(),
@@ -1226,12 +1210,9 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                     if block.published_version == 0
                                         || block.published_version > update.version
                                     {
-                                        return Err(
-                                            DataFusionError::Execution(
-                                                "invalid shuffle publication version"
-                                                    .into(),
-                                            ),
-                                        );
+                                        return Err(DataFusionError::Execution(
+                                            "invalid shuffle publication version".into(),
+                                        ));
                                     }
                                     let location: PartitionLocation = block
                                         .location
@@ -1248,17 +1229,12 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                         != reader.handle.job_id
                                         || location.partition_id.stage_id
                                             != reader.handle.stage_id as usize
-                                        || location
-                                            .partition_id
-                                            .partition_id
+                                        || location.partition_id.partition_id
                                             != upstream as usize
                                     {
-                                        return Err(
-                                            DataFusionError::Execution(
-                                                "shuffle location identity mismatch"
-                                                    .into(),
-                                            ),
-                                        );
+                                        return Err(DataFusionError::Execution(
+                                            "shuffle location identity mismatch".into(),
+                                        ));
                                     }
                                     let key = (
                                         location.map_partition_id,
@@ -1267,18 +1243,13 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                     );
                                     match state.seen.get(&key) {
                                         None => {
-                                            if state.after.is_some_and(
-                                                |cursor| {
-                                                    block.published_version
-                                                        <= cursor
-                                                },
-                                            ) {
-                                                return Err(
-                                                    DataFusionError::Execution(
-                                                        "invalid shuffle publication version"
-                                                            .into(),
-                                                    ),
-                                                );
+                                            if state.after.is_some_and(|cursor| {
+                                                block.published_version <= cursor
+                                            }) {
+                                                return Err(DataFusionError::Execution(
+                                                    "invalid shuffle publication version"
+                                                        .into(),
+                                                ));
                                             }
                                             state.seen.insert(
                                                 key,
@@ -1291,19 +1262,16 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                                             discovered.add(1);
                                         }
                                         Some((version, previous))
-                                            if *version
-                                                == block.published_version
+                                            if *version == block.published_version
                                                 && previous == &location =>
                                         {
                                             duplicates.add(1);
                                         }
                                         Some(_) => {
-                                            return Err(
-                                                DataFusionError::Execution(
-                                                    "conflicting shuffle location replay"
-                                                        .into(),
-                                                ),
-                                            );
+                                            return Err(DataFusionError::Execution(
+                                                "conflicting shuffle location replay"
+                                                    .into(),
+                                            ));
                                         }
                                     }
                                 }
