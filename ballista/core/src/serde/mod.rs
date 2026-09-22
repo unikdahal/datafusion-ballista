@@ -666,6 +666,31 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     config,
                 )?))
             }
+            PhysicalPlanType::PipelinedShuffleReader(reader) => {
+                let schema: SchemaRef = Arc::new(convert_required!(reader.schema)?);
+                let partitioning = parse_protobuf_partitioning(
+                    reader.partitioning.as_ref(),
+                    &decode_ctx,
+                    schema.as_ref(),
+                    &converter,
+                )?
+                .ok_or_else(|| proto_error("missing pipelined partitioning"))?;
+                Ok(Arc::new(
+                    crate::execution_plans::PipelinedShuffleReaderExec::try_new(
+                        reader
+                            .handle
+                            .clone()
+                            .ok_or_else(|| proto_error("missing shuffle handle"))?,
+                        reader
+                            .upstream_partition_ids
+                            .iter()
+                            .map(|p| *p as usize)
+                            .collect(),
+                        schema,
+                        partitioning,
+                    )?,
+                ))
+            }
             PhysicalPlanType::ShuffleReader(shuffle_reader) => {
                 let stage_id = shuffle_reader.stage_id as usize;
                 let schema: SchemaRef =
@@ -1137,6 +1162,33 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 ))
             })?;
 
+            Ok(())
+        } else if let Some(exec) =
+            node.downcast_ref::<crate::execution_plans::PipelinedShuffleReaderExec>()
+        {
+            let converter = DefaultPhysicalProtoConverter {};
+            let partitioning = serialize_partitioning(
+                &exec.properties().partitioning,
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PipelinedShuffleReader(
+                    protobuf::PipelinedShuffleReaderExecNode {
+                        handle: Some(exec.handle.clone()),
+                        upstream_partition_ids: exec
+                            .upstream_partition_ids
+                            .iter()
+                            .map(|p| *p as u32)
+                            .collect(),
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        partitioning: Some(partitioning),
+                    },
+                )),
+            };
+            proto
+                .encode(buf)
+                .map_err(|e| proto_error(format!("pipelined reader encoding: {e}")))?;
             Ok(())
         } else if let Some(exec) = node.downcast_ref::<ShuffleReaderExec>() {
             let stage_id = exec.stage_id as u32;

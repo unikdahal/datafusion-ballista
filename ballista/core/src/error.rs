@@ -65,6 +65,12 @@ pub enum BallistaError {
     GrpcActionError(String),
     /// Shuffle fetch failed: (executor_id, map_stage_id, map_partition_id, message).
     FetchFailed(String, usize, usize, String),
+    /// The task must be restarted against the current immutable input history.
+    ShuffleGenerationInvalidated {
+        stage_id: usize,
+        expected: u64,
+        current: u64,
+    },
     /// Operation was cancelled.
     Cancelled,
 }
@@ -213,6 +219,14 @@ impl Display for BallistaError {
                 )
             }
             BallistaError::Cancelled => write!(f, "Task cancelled"),
+            BallistaError::ShuffleGenerationInvalidated {
+                stage_id,
+                expected,
+                current,
+            } => write!(
+                f,
+                "Shuffle stage {stage_id} generation {expected} invalidated by {current}"
+            ),
             BallistaError::Configuration(desc) => {
                 write!(f, "Configuration error: {desc}")
             }

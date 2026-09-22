@@ -156,7 +156,11 @@ impl ExecutionEngine for DefaultExecutionEngine {
     ) -> Result<Arc<dyn QueryStageExecutor>> {
         let plan = plan
             .transform(|p| {
-                if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
+                if let Some(reader) = p.downcast_ref::<ballista_core::execution_plans::PipelinedShuffleReaderExec>() {
+                    Ok(Transformed::yes(Arc::new(reader.with_fetch_runtime(
+                        work_dir.to_string(), self.client_pool.clone(),
+                    ))))
+                } else if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
                     match &self.client_pool {
                         Some(client_pool) => Ok(Transformed::yes(Arc::new(
                             reader
