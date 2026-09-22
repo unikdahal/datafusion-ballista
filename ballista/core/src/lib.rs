@@ -91,6 +91,8 @@ pub mod planner;
 pub mod registry;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+/// Shared shuffle exchange identity and lifecycle primitives.
+pub mod shuffle;
 /// Quantile sketching of a fixed-width `ORDER BY` key, NULLs included.
 pub mod sort_key;
 /// General utility functions for Ballista operations.
