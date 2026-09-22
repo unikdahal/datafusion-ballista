@@ -501,6 +501,26 @@ impl UnresolvedStage {
         }
     }
 
+    /// Replaces one child-stage compatibility view atomically.
+    ///
+    /// Barrier consumers use this when a producer exchange seals. Replacing
+    /// the whole snapshot avoids merging canonical exchange state into stale
+    /// per-parent cache contents left by an earlier epoch.
+    pub(crate) fn replace_input(
+        &mut self,
+        stage_id: usize,
+        output: StageOutput,
+    ) -> Result<()> {
+        let Some(input) = self.inputs.get_mut(&stage_id) else {
+            return Err(BallistaError::Internal(format!(
+                "Error replacing input for stage {}, {} is not a valid child stage ID",
+                self.stage_id, stage_id
+            )));
+        };
+        *input = output;
+        Ok(())
+    }
+
     /// Returns true if all inputs are complete and we can resolve all
     /// UnresolvedShuffleExec operators to ShuffleReadExec
     pub fn resolvable(&self) -> bool {
@@ -1373,9 +1393,6 @@ impl StageOutput {
     /// StageOutput remains a compatibility type while graph recovery still
     /// mutates per-parent caches. Completed barrier input must be projected from
     /// ShuffleExchangeState rather than trusting those caches as authoritative.
-    // This adapter lands one PR before graph wiring so the projection contract
-    // can be reviewed independently. Remove the allowance when graph code uses it.
-    #[allow(dead_code)]
     pub(crate) fn from_sealed_exchange(
         exchange: &ShuffleExchangeState,
         epoch: ShuffleExchangeEpoch,

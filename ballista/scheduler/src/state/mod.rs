@@ -50,8 +50,9 @@ pub mod execution_stage;
 pub mod executor_manager;
 /// Session state management.
 pub mod session_manager;
-// The exchange model lands before graph integration so its invariants can be
-// reviewed independently. Remove this allowance when the graph starts owning it.
+// Some exchange APIs intentionally land ahead of their subscription/reader
+// consumers. Keep the allowance scoped to this internal module until the
+// complete exchange surface is wired.
 #[allow(dead_code)]
 /// Canonical state for materialized shuffle exchanges.
 pub(crate) mod shuffle_exchange;

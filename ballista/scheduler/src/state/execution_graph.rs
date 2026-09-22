@@ -44,6 +44,7 @@ use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::{
     ExecutorMetadata, PartitionId, PartitionLocation, PartitionStats, TaskKey,
 };
+use ballista_core::shuffle::{ShuffleExchangeId, ShuffleExchangeLifecycle};
 
 use crate::display::print_stage_metrics;
 use crate::planner::DistributedPlanner;
@@ -55,6 +56,7 @@ use crate::state::execution_stage::RunningStage;
 pub(crate) use crate::state::execution_stage::{
     ExecutionStage, ResolvedStage, StageOutput, TaskInfo, UnresolvedStage,
 };
+use crate::state::shuffle_exchange::{ShuffleExchangeError, ShuffleExchangeState};
 use crate::state::task_manager::UpdatedStages;
 
 /// Boxed [ExecutionGraph]
@@ -143,7 +145,10 @@ pub trait ExecutionGraph: Debug {
     fn revive(&mut self) -> bool;
 
     /// Update task statuses and task metrics in the graph.
-    /// This will also push shuffle partitions to their respective shuffle read stages.
+    ///
+    /// Intermediate shuffle output is committed to the canonical exchange as
+    /// producer tasks succeed. Barrier parents receive a compatibility snapshot
+    /// only after the producer exchange seals.
     fn update_task_status(
         &mut self,
         executor: &ExecutorMetadata,
@@ -302,6 +307,11 @@ pub struct StaticExecutionGraph {
     end_time: u64,
     /// Map from Stage ID -> ExecutionStage
     stages: HashMap<usize, ExecutionStage>,
+    /// Canonical committed output for every intermediate producer stage.
+    ///
+    /// Parent StageOutput values are compatibility snapshots derived from these
+    /// exchanges only after the producer seals.
+    shuffle_exchanges: HashMap<usize, ShuffleExchangeState>,
     /// Locations of this `ExecutionGraph` final output locations
     output_locations: Vec<PartitionLocation>,
     /// Failed stage attempts, record the failed stage attempts to limit the retry times.
@@ -354,6 +364,19 @@ impl StaticExecutionGraph {
 
         let builder = ExecutionStageBuilder::new(session_config.clone());
         let stages = builder.build(shuffle_stages)?;
+        let shuffle_exchanges = stages
+            .iter()
+            .filter(|(_, stage)| !stage.output_links().is_empty())
+            .map(|(stage_id, _)| {
+                (
+                    *stage_id,
+                    ShuffleExchangeState::new(ShuffleExchangeId::new(
+                        job_id.to_owned(),
+                        *stage_id,
+                    )),
+                )
+            })
+            .collect();
 
         let started_at = timestamp_millis();
 
@@ -376,6 +399,7 @@ impl StaticExecutionGraph {
             start_time: started_at,
             end_time: 0,
             stages,
+            shuffle_exchanges,
             output_locations: vec![],
             failed_stage_attempts: HashMap::new(),
             session_config,
@@ -383,6 +407,94 @@ impl StaticExecutionGraph {
             physical_plan: plan,
         })
     }
+
+    fn exchange_error(
+        job_id: &JobId,
+        stage_id: usize,
+        error: ShuffleExchangeError,
+    ) -> BallistaError {
+        BallistaError::Internal(format!(
+            "Shuffle exchange error for job {job_id}, stage {stage_id}: {error}"
+        ))
+    }
+
+    fn invalidate_exchange_task_sets(
+        &mut self,
+        invalidations: &HashMap<usize, HashSet<usize>>,
+    ) -> Result<()> {
+        let job_id = self.job_id.clone();
+        for (stage_id, task_ids) in invalidations {
+            if task_ids.is_empty() {
+                continue;
+            }
+            let exchange = self.shuffle_exchanges.get_mut(stage_id).ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "Missing shuffle exchange for intermediate job/stage {job_id}/{stage_id}"
+                ))
+            })?;
+            let epoch = exchange.epoch();
+            let task_ids: Vec<_> = task_ids.iter().copied().collect();
+            exchange
+                .invalidate_tasks(epoch, &task_ids)
+                .map_err(|error| Self::exchange_error(&job_id, *stage_id, error))?;
+        }
+        Ok(())
+    }
+
+    fn rerun_successful_stage_checked(&mut self, stage_id: usize) -> Result<bool> {
+        let Some(ExecutionStage::Successful(stage)) = self.stages.get(&stage_id) else {
+            warn!(
+                "Fail to find a successful stage {}/{} to rerun",
+                self.job_id(),
+                stage_id
+            );
+            return Ok(false);
+        };
+
+        let lost_task_ids: HashSet<_> = stage
+            .task_infos
+            .iter()
+            .filter_map(|task| match &task.task_status {
+                task_status::Status::Failed(FailedTask {
+                    failed_reason: Some(FailedReason::ResultLost(_)),
+                    ..
+                }) => Some(task.task_id),
+                _ => None,
+            })
+            .collect();
+        let is_intermediate = !stage.output_links.is_empty();
+        let running_stage = stage.to_running();
+
+        if is_intermediate {
+            if lost_task_ids.is_empty() {
+                return Err(BallistaError::Internal(format!(
+                    "Cannot rerun successful intermediate job/stage {}/{} without lost exchange output",
+                    self.job_id, stage_id
+                )));
+            }
+            self.invalidate_exchange_task_sets(&HashMap::from([(
+                stage_id,
+                lost_task_ids,
+            )]))?;
+            let exchange = self.shuffle_exchanges.get(&stage_id).ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "Missing shuffle exchange for intermediate job/stage {}/{}",
+                    self.job_id, stage_id
+                ))
+            })?;
+            if exchange.lifecycle() != ShuffleExchangeLifecycle::Open {
+                return Err(BallistaError::Internal(format!(
+                    "Shuffle exchange for rerun job/stage {}/{} did not reopen after invalidation",
+                    self.job_id, stage_id
+                )));
+            }
+        }
+
+        self.stages
+            .insert(stage_id, ExecutionStage::Running(running_stage));
+        Ok(true)
+    }
+
 
     /// Processing stage status update after task status changing
     fn processing_stages_update(
@@ -418,7 +530,7 @@ impl StaticExecutionGraph {
             }
 
             for stage_id in updated_stages.resubmit_successful_stages {
-                self.rerun_successful_stage(stage_id);
+                self.rerun_successful_stage_checked(stage_id)?;
             }
 
             if !running_tasks_to_cancel.is_empty() {
@@ -452,7 +564,7 @@ impl StaticExecutionGraph {
         Ok(events)
     }
 
-    /// Return a Vec of resolvable stage ids
+    /// Updates final output or installs a sealed canonical barrier snapshot.
     fn update_stage_output_links(
         &mut self,
         stage_id: usize,
@@ -463,37 +575,44 @@ impl StaticExecutionGraph {
         let mut resolved_stages = vec![];
         let job_id = &self.job_id;
         if output_links.is_empty() {
-            // If `output_links` is empty, then this is a final stage
+            // Final-stage output behavior is unchanged.
             self.output_locations.extend(locations);
-        } else {
-            for link in output_links.iter() {
-                // If this is an intermediate stage, we need to push its `PartitionLocation`s to the parent stage
-                if let Some(linked_stage) = self.stages.get_mut(link) {
-                    if let ExecutionStage::UnResolved(linked_unresolved_stage) =
-                        linked_stage
-                    {
-                        linked_unresolved_stage
-                            .add_input_partitions(stage_id, locations.clone())?;
+            return Ok(resolved_stages);
+        }
 
-                        // If all tasks for this stage are complete, mark the input complete in the parent stage
-                        if is_completed {
-                            linked_unresolved_stage.complete_input(stage_id);
-                        }
+        // Barrier parents must not accumulate a second mutable copy of partial
+        // producer output. The canonical exchange owns partial publications;
+        // StageOutput is installed only once a current epoch is sealed.
+        if !is_completed {
+            return Ok(resolved_stages);
+        }
 
-                        // If all input partitions are ready, we can resolve any UnresolvedShuffleExec in the parent stage plan
-                        if linked_unresolved_stage.resolvable() {
-                            resolved_stages.push(linked_unresolved_stage.stage_id);
-                        }
-                    } else {
-                        return Err(BallistaError::Internal(format!(
-                            "Error updating job {job_id}: The stage {link} as the output link of stage {stage_id}  should be unresolved"
-                        )));
+        let stage_output = {
+            let exchange = self.shuffle_exchanges.get(&stage_id).ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "Missing shuffle exchange for intermediate job/stage {job_id}/{stage_id}"
+                ))
+            })?;
+            StageOutput::from_sealed_exchange(exchange, exchange.epoch())
+                .map_err(|error| Self::exchange_error(job_id, stage_id, error))?
+        };
+
+        for link in output_links {
+            if let Some(linked_stage) = self.stages.get_mut(&link) {
+                if let ExecutionStage::UnResolved(linked_unresolved_stage) = linked_stage {
+                    linked_unresolved_stage.replace_input(stage_id, stage_output.clone())?;
+                    if linked_unresolved_stage.resolvable() {
+                        resolved_stages.push(linked_unresolved_stage.stage_id);
                     }
                 } else {
                     return Err(BallistaError::Internal(format!(
-                        "Error updating job {job_id}: Invalid output link {stage_id} for stage {link}"
+                        "Error updating job {job_id}: The stage {link} as the output link of stage {stage_id} should be unresolved"
                     )));
                 }
+            } else {
+                return Err(BallistaError::Internal(format!(
+                    "Error updating job {job_id}: Invalid output link {stage_id} for stage {link}"
+                )));
             }
         }
         Ok(resolved_stages)
@@ -534,6 +653,8 @@ impl StaticExecutionGraph {
         let job_id = self.job_id.clone();
         // collect the input stages that need to resubmit
         let mut resubmit_inputs: HashSet<usize> = HashSet::new();
+        let mut running_output_invalidations: HashMap<usize, HashSet<usize>> =
+            HashMap::new();
 
         let mut reset_running_stage = HashSet::new();
         let mut rollback_resolved_stages = HashSet::new();
@@ -553,6 +674,22 @@ impl StaticExecutionGraph {
                         &mut stage.inputs
                     }
                     ExecutionStage::Running(stage) => {
+                        if !stage.output_links.is_empty() {
+                            let lost_published_tasks = stage.task_infos.iter().filter_map(|task| {
+                                match &task.task_status {
+                                    task_status::Status::Successful(SuccessfulTask {
+                                        executor_id: task_executor,
+                                        ..
+                                    }) if task_executor == executor_id => Some(task.task_id),
+                                    _ => None,
+                                }
+                            });
+                            running_output_invalidations
+                                .entry(*stage_id)
+                                .or_default()
+                                .extend(lost_published_tasks);
+                        }
+
                         let reset = stage.reset_tasks(executor_id);
                         if reset > 0 {
                             warn!(
@@ -627,6 +764,11 @@ impl StaticExecutionGraph {
                 });
         }
 
+        for stage_id in &rollback_running_stages {
+            running_output_invalidations.remove(stage_id);
+        }
+        self.invalidate_exchange_task_sets(&running_output_invalidations)?;
+
         for stage_id in rollback_resolved_stages.iter() {
             self.rollback_resolved_stage(*stage_id)?;
         }
@@ -641,7 +783,7 @@ impl StaticExecutionGraph {
         }
 
         for stage_id in resubmit_successful_stages.iter() {
-            self.rerun_successful_stage(*stage_id);
+            self.rerun_successful_stage_checked(*stage_id)?;
         }
 
         let mut reset_stage = HashSet::new();
@@ -792,7 +934,8 @@ impl ExecutionGraph for StaticExecutionGraph {
         for (stage_id, stage_task_statuses) in job_task_statuses {
             if let Some(stage) = self.stages.get_mut(&stage_id) {
                 if let ExecutionStage::Running(running_stage) = stage {
-                    let mut locations = vec![];
+                    let mut final_locations = vec![];
+                    let mut exchange_publications = vec![];
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
@@ -965,9 +1108,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                             running_stage
                                 .append_window_state_reports(task_id, window_state);
 
-                            locations.append(&mut partition_to_location(
+                            let task_locations = partition_to_location(
                                 &job_id, task_id, stage_id, executor, partitions,
-                            ));
+                            );
+                            if running_stage.output_links.is_empty() {
+                                final_locations.extend(task_locations);
+                            } else {
+                                exchange_publications.push((task_id, task_locations));
+                            }
                         } else {
                             warn!(
                                 "The task {task_identity}'s status is invalid for updating"
@@ -976,7 +1124,8 @@ impl ExecutionGraph for StaticExecutionGraph {
                     }
 
                     let is_final_successful = running_stage.is_successful()
-                        && !reset_running_stages.contains_key(&stage_id);
+                        && !reset_running_stages.contains_key(&stage_id)
+                        && !rollback_running_stages.contains_key(&stage_id);
                     if is_final_successful {
                         successful_stages.insert(stage_id);
                         // if this stage is final successful, we want to combine the stage metrics to plan's metric set and print out the plan
@@ -997,12 +1146,36 @@ impl ExecutionGraph for StaticExecutionGraph {
                     }
 
                     let output_links = running_stage.output_links.clone();
+                    if !output_links.is_empty()
+                        && !rollback_running_stages.contains_key(&stage_id)
+                    {
+                        let exchange =
+                            self.shuffle_exchanges.get_mut(&stage_id).ok_or_else(|| {
+                                BallistaError::Internal(format!(
+                                    "Missing shuffle exchange for intermediate job/stage {job_id}/{stage_id}"
+                                ))
+                            })?;
+                        let epoch = exchange.epoch();
+                        for (task_id, task_locations) in exchange_publications {
+                            exchange
+                                .publish(epoch, task_id, task_locations)
+                                .map_err(|error| {
+                                    Self::exchange_error(&job_id, stage_id, error)
+                                })?;
+                        }
+                        if is_final_successful {
+                            exchange.seal(epoch).map_err(|error| {
+                                Self::exchange_error(&job_id, stage_id, error)
+                            })?;
+                        }
+                    }
+
                     resolved_stages.extend(
                         &mut self
                             .update_stage_output_links(
                                 stage_id,
                                 is_final_successful,
-                                locations,
+                                final_locations,
                                 output_links,
                             )?
                             .into_iter(),
@@ -1175,6 +1348,17 @@ impl ExecutionGraph for StaticExecutionGraph {
                 )));
             }
         }
+
+        // reset_running_stages represents output loss from an intermediate
+        // producer that remains in the same stage attempt. Roll only those
+        // task publications. Stages that fully roll back are handled by
+        // rollback_running_stage and must not receive a second epoch bump here.
+        let running_exchange_invalidations: HashMap<_, _> = reset_running_stages
+            .iter()
+            .filter(|(stage_id, _)| !rollback_running_stages.contains_key(stage_id))
+            .map(|(stage_id, task_ids)| (*stage_id, task_ids.clone()))
+            .collect();
+        self.invalidate_exchange_task_sets(&running_exchange_invalidations)?;
 
         self.processing_stages_update(UpdatedStages {
             resolved_stages,
@@ -1354,29 +1538,53 @@ impl ExecutionGraph for StaticExecutionGraph {
         stage_id: usize,
         failure_reasons: HashSet<String>,
     ) -> Result<Vec<RunningTaskInfo>> {
-        if let Some(ExecutionStage::Running(stage)) = self.stages.get(&stage_id) {
-            let running_tasks = stage
-                .running_tasks()
-                .into_iter()
-                .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
-                    task_id,
-                    job_id: self.job_id.clone(),
-                    stage_id,
-                    executor_id,
-                })
-                .collect();
-            let unresolved_stage = stage.to_unresolved(failure_reasons)?;
-            self.stages
-                .insert(stage_id, ExecutionStage::UnResolved(unresolved_stage));
-            Ok(running_tasks)
-        } else {
+        let Some(ExecutionStage::Running(stage)) = self.stages.get(&stage_id) else {
             warn!(
                 "Fail to find a running stage {}/{} to rollback",
                 self.job_id(),
                 stage_id
             );
-            Ok(vec![])
+            return Ok(vec![]);
+        };
+
+        let running_tasks = stage
+            .running_tasks()
+            .into_iter()
+            .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
+                task_id,
+                job_id: self.job_id.clone(),
+                stage_id,
+                executor_id,
+            })
+            .collect();
+        let is_intermediate = !stage.output_links.is_empty();
+
+        // Build the replacement stage first. If plan rollback fails, neither
+        // graph state nor exchange history is invalidated.
+        let unresolved_stage = stage.to_unresolved(failure_reasons)?;
+
+        if is_intermediate {
+            let job_id = self.job_id.clone();
+            let exchange = self.shuffle_exchanges.get_mut(&stage_id).ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "Missing shuffle exchange for intermediate job/stage {job_id}/{stage_id}"
+                ))
+            })?;
+            let epoch = exchange.epoch();
+
+            // A stage-attempt rollback discards the computation that produced
+            // every publication from the attempt. Do not infer this set from
+            // TaskInfo: some tasks may already have been rewritten to
+            // ResultLost/TaskKilled while their accepted publication still
+            // exists. The exchange is authoritative for its publication set.
+            exchange
+                .invalidate_all(epoch)
+                .map_err(|error| Self::exchange_error(&job_id, stage_id, error))?;
         }
+
+        self.stages
+            .insert(stage_id, ExecutionStage::UnResolved(unresolved_stage));
+        Ok(running_tasks)
     }
 
     /// Convert resolved stage to be unresolved
@@ -1398,17 +1606,15 @@ impl ExecutionGraph for StaticExecutionGraph {
 
     /// Convert successful stage to be running
     fn rerun_successful_stage(&mut self, stage_id: usize) -> bool {
-        if let Some(ExecutionStage::Successful(stage)) = self.stages.remove(&stage_id) {
-            self.stages
-                .insert(stage_id, ExecutionStage::Running(stage.to_running()));
-            true
-        } else {
-            warn!(
-                "Fail to find a successful stage {}/{} to rerun",
-                self.job_id(),
-                stage_id
-            );
-            false
+        match self.rerun_successful_stage_checked(stage_id) {
+            Ok(rerun) => rerun,
+            Err(error) => {
+                error!(
+                    "Failed to rerun successful job/stage {}/{}: {}",
+                    self.job_id, stage_id, error
+                );
+                false
+            }
         }
     }
 
@@ -1827,6 +2033,7 @@ mod test {
 
     use crate::scheduler_server::event::QueryStageSchedulerEvent;
     use ballista_core::error::{BallistaError, Result};
+    use ballista_core::shuffle::ShuffleExchangeLifecycle;
     use ballista_core::serde::protobuf::{
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status, task_status,
@@ -1938,6 +2145,136 @@ mod test {
             let stage = graph.stages().get(&(*id as usize)).unwrap();
             assert!(!stage.output_links().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_intermediate_exchange_owns_partial_output_until_seal() -> Result<()> {
+        let executor = mock_executor("executor-id1".to_string());
+        let mut graph = test_aggregation_plan(4).await;
+
+        assert_eq!(graph.shuffle_exchanges.len(), 1);
+        let producer_stage_id = *graph.shuffle_exchanges.keys().next().unwrap();
+        let consumer_stage_id = graph.stages[&producer_stage_id].output_links()[0];
+
+        graph.revive();
+        let producer_task_count = match graph.stages.get(&producer_stage_id) {
+            Some(ExecutionStage::Running(stage)) => stage.available_tasks(),
+            other => panic!("expected producer stage to be running, got {other:?}"),
+        };
+        assert!(producer_task_count > 1);
+
+        let first_task = graph.pop_next_task(&executor.id)?.unwrap();
+        assert_eq!(first_task.key.stage_id, producer_stage_id);
+        let first_status = mock_completed_task(first_task, &executor.id);
+        graph.update_task_status(&executor, vec![first_status], 1, 1)?;
+
+        let exchange = &graph.shuffle_exchanges[&producer_stage_id];
+        assert!(exchange.has_committed_artifacts());
+        assert_eq!(exchange.lifecycle(), ShuffleExchangeLifecycle::Open);
+
+        match graph.stages.get(&consumer_stage_id) {
+            Some(ExecutionStage::UnResolved(stage)) => {
+                let input = &stage.inputs[&producer_stage_id];
+                assert!(!input.is_complete());
+                assert!(input.partition_locations.is_empty());
+            }
+            other => panic!("expected barrier consumer to remain unresolved, got {other:?}"),
+        }
+
+        for _ in 1..producer_task_count {
+            let task = graph.pop_next_task(&executor.id)?.unwrap();
+            assert_eq!(task.key.stage_id, producer_stage_id);
+            let status = mock_completed_task(task, &executor.id);
+            graph.update_task_status(&executor, vec![status], 1, 1)?;
+        }
+
+        let exchange = &graph.shuffle_exchanges[&producer_stage_id];
+        assert_eq!(exchange.lifecycle(), ShuffleExchangeLifecycle::Sealed);
+        let epoch = exchange.epoch();
+        let canonical = exchange.barrier_locations(epoch).unwrap();
+
+        let input = match graph.stages.get(&consumer_stage_id) {
+            Some(ExecutionStage::Resolved(stage)) => &stage.inputs[&producer_stage_id],
+            other => panic!("expected barrier consumer to resolve, got {other:?}"),
+        };
+        assert!(input.is_complete());
+        let cached_count: usize = input.partition_locations.values().map(Vec::len).sum();
+        assert_eq!(cached_count, canonical.len());
+
+        let mut cached_keys: Vec<_> = input
+            .partition_locations
+            .values()
+            .flatten()
+            .map(|loc| {
+                (
+                    loc.map_partition_id,
+                    loc.partition_id.partition_id,
+                    loc.file_id,
+                )
+            })
+            .collect();
+        let mut canonical_keys: Vec<_> = canonical
+            .iter()
+            .map(|loc| {
+                (
+                    loc.map_partition_id,
+                    loc.partition_id.partition_id,
+                    loc.file_id,
+                )
+            })
+            .collect();
+        cached_keys.sort();
+        canonical_keys.sort();
+        assert_eq!(cached_keys, canonical_keys);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_full_stage_rollback_invalidates_publication_after_task_status_rewrite()
+    -> Result<()> {
+        let executor = mock_executor("executor-id1".to_string());
+        let mut graph = test_two_aggregations_plan(4).await;
+
+        // Finish the leaf producer so the middle intermediate stage can run.
+        revive_graph_and_complete_next_stage_with_executor(&mut graph, &executor)?;
+        assert!(graph.revive());
+
+        let task = graph.pop_next_task(&executor.id)?.unwrap();
+        let stage_id = task.key.stage_id;
+        let task_id = task.key.task_id;
+        assert!(
+            !graph.stages[&stage_id].output_links().is_empty(),
+            "expected the middle stage to be an intermediate producer"
+        );
+
+        let status = mock_completed_task(task, &executor.id);
+        graph.update_task_status(&executor, vec![status], 4, 4)?;
+
+        let epoch_before = graph.shuffle_exchanges[&stage_id].epoch();
+        assert!(graph.shuffle_exchanges[&stage_id].is_task_accepted(task_id));
+
+        // Simulate another recovery path rewriting TaskInfo before the entire
+        // stage attempt is rolled back. The exchange publication still exists.
+        match graph.stages.get_mut(&stage_id) {
+            Some(ExecutionStage::Running(stage)) => stage.reset_task_info(task_id),
+            other => panic!("expected intermediate producer to be running, got {other:?}"),
+        }
+        assert!(graph.shuffle_exchanges[&stage_id].is_task_accepted(task_id));
+
+        graph.rollback_running_stage(stage_id, HashSet::new())?;
+
+        let exchange = &graph.shuffle_exchanges[&stage_id];
+        assert!(exchange.epoch() > epoch_before);
+        assert_eq!(exchange.lifecycle(), ShuffleExchangeLifecycle::Open);
+        assert!(!exchange.is_task_accepted(task_id));
+        assert!(!exchange.has_committed_artifacts());
+        assert!(matches!(
+            graph.stages.get(&stage_id),
+            Some(ExecutionStage::UnResolved(_))
+        ));
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -2518,6 +2855,11 @@ mod test {
 
         // Complete the Stage 1
         revive_graph_and_complete_next_stage_with_executor(&mut agg_graph, &executor1)?;
+        let stage_one_epoch = agg_graph.shuffle_exchanges[&1].epoch();
+        assert_eq!(
+            agg_graph.shuffle_exchanges[&1].lifecycle(),
+            ShuffleExchangeLifecycle::Sealed
+        );
 
         // 1st task in the Stage 2
         if let Some(task) = agg_graph.pop_next_task(&executor2.id)? {
@@ -2539,6 +2881,11 @@ mod test {
 
         // executor 1 lost
         let reset = agg_graph.reset_stages_on_lost_executor(&executor1.id)?;
+        assert!(agg_graph.shuffle_exchanges[&1].epoch() > stage_one_epoch);
+        assert_eq!(
+            agg_graph.shuffle_exchanges[&1].lifecycle(),
+            ShuffleExchangeLifecycle::Open
+        );
 
         // Two stages were reset, Stage 2 rollback to Unresolved and Stage 1 move to Running
         assert_eq!(reset.0.len(), 2);
@@ -2585,6 +2932,11 @@ mod test {
 
         // Complete the Stage 1
         revive_graph_and_complete_next_stage(&mut agg_graph)?;
+        let stage_one_epoch = agg_graph.shuffle_exchanges[&1].epoch();
+        assert_eq!(
+            agg_graph.shuffle_exchanges[&1].lifecycle(),
+            ShuffleExchangeLifecycle::Sealed
+        );
 
         // 1st task in the Stage 2
         let task1 = agg_graph.pop_next_task(&executor2.id)?.unwrap();
@@ -2616,6 +2968,11 @@ mod test {
             stage_events[0],
             QueryStageSchedulerEvent::CancelTasks(_)
         ));
+        assert!(agg_graph.shuffle_exchanges[&1].epoch() > stage_one_epoch);
+        assert_eq!(
+            agg_graph.shuffle_exchanges[&1].lifecycle(),
+            ShuffleExchangeLifecycle::Open
+        );
 
         // Stage 1 is running
         let running_stage = agg_graph.running_stages();
