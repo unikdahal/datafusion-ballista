@@ -85,10 +85,11 @@ impl ShuffleExchangeId {
     }
 }
 
-/// Identity of one valid materialized history of a shuffle exchange.
+/// Generation number for one valid materialized history of a shuffle exchange.
 ///
 /// An epoch is scoped to one [ShuffleExchangeId]; equal numeric epoch values
-/// on different exchanges do not identify the same materialized history.
+/// on different exchanges do not identify the same materialized history. The
+/// complete fencing identity is represented by [ShuffleExchangeGeneration].
 ///
 /// Epoch zero is intentionally unrepresentable. This keeps zero available as
 /// an "unset" value at serialization boundaries and makes stale/uninitialized
@@ -131,8 +132,8 @@ impl ShuffleExchangeEpoch {
 /// Monotonic event position within one [ShuffleExchangeEpoch].
 ///
 /// Sequence zero means "before the first event". Visible exchange events start
-/// at sequence one. A sequence has no standalone meaning: consumers should pair
-/// it with the epoch whose event history it indexes via [ShuffleExchangeCursor].
+/// at sequence one. A sequence has no standalone meaning: consumers pair it with
+/// its [ShuffleExchangeGeneration] via [ShuffleExchangeCursor].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShuffleExchangeSequence(u64);
 
