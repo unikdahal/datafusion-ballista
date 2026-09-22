@@ -20,18 +20,22 @@
 mod common;
 
 use ballista::prelude::SessionConfigExt;
+use ballista_core::client::BallistaClient;
 use ballista_core::config::{
     BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK,
     BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ,
     BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BallistaConfig,
 };
+use ballista_core::execution_plans::ChaosExec;
 use ballista_core::execution_plans::pipelined_shuffle_reader::producing_input_observed;
-use ballista_core::execution_plans::{ChaosExec, execute_physical_plan};
+use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    ExecutorStoppedParams, GetJobMetricsParams, OpenShuffleInputParams,
-    ShuffleInputHandle, operator_metric, scheduler_grpc_client::SchedulerGrpcClient,
-    shuffle_input_result,
+    ExecuteQueryParams, ExecutorStoppedParams, GetJobMetricsParams, GetJobStatusParams,
+    KeyValuePair, OpenShuffleInputParams, ShuffleInputHandle, execute_query_params,
+    execute_query_result, job_status, operator_metric,
+    scheduler_grpc_client::SchedulerGrpcClient, shuffle_input_result,
 };
+use ballista_core::serde::scheduler::ShuffleLayout;
 use datafusion::arrow::array::Int32Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -41,6 +45,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionConfig;
+use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -70,7 +75,7 @@ fn straggler_plan(delay_ms: u64) -> Arc<dyn ExecutionPlan> {
         };
         inputs.push(input);
     }
-    let input: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(inputs));
+    let input = UnionExec::try_new(inputs).unwrap();
     let partitioning = Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 4);
     let first: Arc<dyn ExecutionPlan> =
         Arc::new(RepartitionExec::try_new(input, partitioning.clone()).unwrap());
@@ -97,6 +102,107 @@ fn assert_expected_rows(result: &[RecordBatch]) {
     assert_eq!(values, (0..8).collect::<Vec<_>>());
 }
 
+// Submit directly so assertions and failure injection use the scheduler's job
+// ID. execute_physical_plan accepts a session ID, not a caller-chosen job ID.
+async fn submit_query(
+    scheduler: &mut SchedulerGrpcClient<tonic::transport::Channel>,
+    config: &SessionConfig,
+    delay_ms: u64,
+) -> String {
+    let codec = config.ballista_physical_extension_codec();
+    let plan = PhysicalPlanNode::try_from_physical_plan(
+        straggler_plan(delay_ms),
+        codec.as_ref(),
+    )
+    .unwrap();
+    let mut bytes = vec![];
+    plan.try_encode(&mut bytes).unwrap();
+    let result = scheduler
+        .execute_query(ExecuteQueryParams {
+            query: Some(execute_query_params::Query::PhysicalPlan(bytes)),
+            session_id: String::new(),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            settings: config
+                .options()
+                .entries()
+                .into_iter()
+                .map(|entry| KeyValuePair {
+                    key: entry.key,
+                    value: entry.value,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    match result.result.unwrap() {
+        execute_query_result::Result::Success(success) => success.job_id,
+        execute_query_result::Result::Failure(failure) => {
+            panic!("query submission failed: {failure:?}")
+        }
+    }
+}
+
+async fn collect_job(
+    mut scheduler: SchedulerGrpcClient<tonic::transport::Channel>,
+    job_id: String,
+) -> Vec<RecordBatch> {
+    loop {
+        let result = scheduler
+            .get_job_status(GetJobStatusParams {
+                job_id: job_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        match result.status.and_then(|status| status.status) {
+            Some(job_status::Status::Failed(failure)) => {
+                panic!("job {job_id} failed: {}", failure.error)
+            }
+            Some(job_status::Status::Successful(success)) => {
+                let mut batches = vec![];
+                for location in success.partition_location {
+                    let executor = location.executor_meta.unwrap();
+                    let mut client = BallistaClient::try_new(
+                        &executor.host,
+                        executor.port as u16,
+                        BallistaConfig::default().grpc_client_max_message_size(),
+                        false,
+                        None,
+                        3,
+                        100,
+                        0,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    let stream = client
+                        .fetch_partition(
+                            &executor.id,
+                            &location.partition_id.unwrap().into(),
+                            location.file_id,
+                            if location.is_sort_shuffle {
+                                ShuffleLayout::Sort
+                            } else {
+                                ShuffleLayout::Passthrough
+                            },
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                    batches.extend(
+                        datafusion::physical_plan::common::collect(stream)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                return batches;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 async fn run(enabled: bool, remote: bool, delay_ms: u64) -> Duration {
     let (host, port) = common::setup_test_cluster().await;
     let config = SessionConfig::new_with_ballista()
@@ -105,24 +211,15 @@ async fn run(enabled: bool, remote: bool, delay_ms: u64) -> Duration {
         .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1")
         .set_bool(BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, remote)
         .set_bool(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, true);
-    let codec = config.ballista_physical_extension_codec();
-    let job_id = uuid::Uuid::new_v4().to_string();
-    let start = Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(60), async {
-        let stream = execute_physical_plan::<PhysicalPlanNode>(
-            format!("http://{host}:{port}"),
-            &BallistaConfig::default(),
-            straggler_plan(delay_ms),
-            codec.as_ref(),
-            job_id.clone(),
-            config,
-        )
+    let mut scheduler = SchedulerGrpcClient::connect(format!("http://{host}:{port}"))
         .await
         .unwrap();
-        datafusion::physical_plan::common::collect(stream)
-            .await
-            .unwrap()
-    })
+    let start = Instant::now();
+    let job_id = submit_query(&mut scheduler, &config, delay_ms).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        collect_job(scheduler.clone(), job_id.clone()),
+    )
     .await
     .expect("pipelined query must not deadlock");
     let duration = start.elapsed();
@@ -133,9 +230,6 @@ async fn run(enabled: bool, remote: bool, delay_ms: u64) -> Duration {
         // regresses to the full producer barrier. A reader that starts before
         // producer seal must observe at least one producing update and later a
         // sealed update, so one local reader partition necessarily polls twice.
-        let mut scheduler = SchedulerGrpcClient::connect(format!("http://{host}:{port}"))
-            .await
-            .unwrap();
         let metrics = scheduler
             .get_job_metrics(GetJobMetricsParams { job_id })
             .await
@@ -185,32 +279,20 @@ async fn executor_loss_invalidates_live_generation_and_recovers_exactly_once() {
     let mut scheduler = SchedulerGrpcClient::connect(format!("http://{host}:{port}"))
         .await
         .unwrap();
-    let job_id = uuid::Uuid::new_v4().to_string();
     let config = SessionConfig::new_with_ballista()
         .with_ballista_adaptive_query_planner(false)
         .with_ballista_shuffle_pipelined_enabled(true)
         .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "1")
         .set_bool(BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, true)
         .set_bool(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, true);
-    let codec = config.ballista_physical_extension_codec();
-    let query_host = host.clone();
+    let job_id = submit_query(&mut scheduler, &config, 5000).await;
     let query_job_id = job_id.clone();
+    let query_scheduler = scheduler.clone();
     let query = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(90), async {
-            let stream = execute_physical_plan::<PhysicalPlanNode>(
-                format!("http://{query_host}:{port}"),
-                &BallistaConfig::default(),
-                straggler_plan(5000),
-                codec.as_ref(),
-                query_job_id,
-                config,
-            )
-            .await
-            .unwrap();
-            datafusion::physical_plan::common::collect(stream)
-                .await
-                .unwrap()
-        })
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            collect_job(query_scheduler, query_job_id),
+        )
         .await
         .expect("recovery query must not deadlock")
     });
@@ -318,6 +400,16 @@ async fn executor_loss_invalidates_live_generation_and_recovers_exactly_once() {
         current_generation > old_handle.generation,
         "recovery must roll the shuffle generation forward"
     );
+
+    // The cluster starts with one executor. Once it is declared lost, provide
+    // replacement capacity instead of depending on a dead executor rejoining.
+    ballista_executor::new_standalone_executor(
+        scheduler.clone(),
+        4,
+        BallistaCodec::default(),
+    )
+    .await
+    .unwrap();
 
     let result = query.await.expect("recovery query task must not panic");
     assert_expected_rows(&result);

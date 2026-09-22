@@ -342,9 +342,19 @@ impl ShuffleInputRegistry {
         generation: u64,
         lost: &HashSet<ShuffleBlockKey>,
     ) -> Result<u64> {
-        let state = self.current_mut(job, stage, generation)?;
         let lost_tasks: HashSet<_> =
             lost.iter().map(|key| key.producer_task_id).collect();
+        self.invalidate_tasks(job, stage, generation, &lost_tasks)
+    }
+
+    fn invalidate_tasks(
+        &mut self,
+        job: &JobId,
+        stage: usize,
+        generation: u64,
+        lost_tasks: &HashSet<usize>,
+    ) -> Result<u64> {
+        let state = self.current_mut(job, stage, generation)?;
         if lost_tasks.is_empty() {
             return Ok(state.generation);
         }
@@ -455,16 +465,19 @@ impl ShuffleInputRegistry {
         let Some(state) = self.get(job, stage) else {
             return Ok(false);
         };
+        // An accepted empty publication is still part of the sealed history.
+        // Losing it must reopen that history just like losing a materialized
+        // block; otherwise the replacement task cannot commit after seal.
         let lost: HashSet<_> = state
-            .blocks
+            .accepted_tasks
             .keys()
-            .filter(|key| !accepted.contains(&key.producer_task_id))
+            .filter(|task| !accepted.contains(task))
             .copied()
             .collect();
         if lost.is_empty() {
             return Ok(false);
         }
-        self.invalidate(job, stage, state.generation, &lost)?;
+        self.invalidate_tasks(job, stage, state.generation, &lost)?;
         Ok(true)
     }
 
@@ -482,7 +495,6 @@ impl ShuffleInputRegistry {
         output.complete = state.lifecycle == ShuffleInputLifecycle::Sealed;
         Some(output)
     }
-
 
     fn current(
         &self,
@@ -819,8 +831,7 @@ mod tests {
         // resurrect task 0 from the retired attempt.
         registry.commit(&job, 1, 2, 2, vec![location(2, 0), location(2, 1)])?;
         assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
-        let ShuffleInputRead::Update(snapshot) =
-            registry.read(&job, 1, 2, 0, &[0, 1])?
+        let ShuffleInputRead::Update(snapshot) = registry.read(&job, 1, 2, 0, &[0, 1])?
         else {
             panic!()
         };
@@ -847,7 +858,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn empty_producing_input_is_not_sealed() -> Result<()> {
         let job = JobId::from("job");
@@ -872,6 +882,34 @@ mod tests {
             registry.read(&job, 1, 1, 0, &[0])?,
             ShuffleInputRead::Closed
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn losing_empty_publication_reopens_sealed_history() -> Result<()> {
+        let job = JobId::from("job");
+        let mut registry = ShuffleInputRegistry::default();
+        registry.create(&job, 1);
+        registry.commit(&job, 1, 1, 0, vec![])?;
+        registry.commit(&job, 1, 1, 1, vec![location(1, 0)])?;
+        registry.seal(&job, 1, 1)?;
+
+        assert!(registry.retain_tasks(&job, 1, &HashSet::from([1]))?);
+        assert!(matches!(
+            registry.read(&job, 1, 1, 0, &[0])?,
+            ShuffleInputRead::Invalidated {
+                expected: 1,
+                current: 2
+            }
+        ));
+        let state = registry.get(&job, 1).unwrap();
+        assert_eq!(state.lifecycle, ShuffleInputLifecycle::Producing);
+        assert_eq!(state.blocks.len(), 1);
+        assert!(!state.accepted_tasks.contains_key(&0));
+
+        registry.commit(&job, 1, 2, 2, vec![])?;
+        registry.seal(&job, 1, 2)?;
+        assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
         Ok(())
     }
 }
