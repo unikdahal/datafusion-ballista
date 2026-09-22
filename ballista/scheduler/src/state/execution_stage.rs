@@ -2202,14 +2202,10 @@ mod tests {
             );
         }
 
-        assert!(stage.mark_materialized_result_lost(
-            0,
-            "shuffle output became unreadable"
-        ));
-        assert!(!stage.mark_materialized_result_lost(
-            0,
-            "duplicate fetch failure"
-        ));
+        assert!(
+            stage.mark_materialized_result_lost(0, "shuffle output became unreadable")
+        );
+        assert!(!stage.mark_materialized_result_lost(0, "duplicate fetch failure"));
 
         assert_eq!(stage.pending.remaining(), 1);
         assert_eq!(stage.pending.next_slice(2), vec![0]);
