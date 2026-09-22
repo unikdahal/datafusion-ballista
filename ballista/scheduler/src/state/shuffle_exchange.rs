@@ -165,6 +165,8 @@ pub(crate) enum ShuffleExchangeError {
         after: ShuffleExchangeCursor,
         current: ShuffleExchangeCursor,
     },
+    /// A barrier snapshot was requested before the current epoch was sealed.
+    BarrierSnapshotBeforeSeal { epoch: ShuffleExchangeEpoch },
     /// The exchange epoch cannot advance without wrapping.
     EpochExhausted,
     /// The event sequence cannot advance without wrapping.
@@ -209,6 +211,11 @@ impl Display for ShuffleExchangeError {
                 after.sequence().get(),
                 current.epoch().get(),
                 current.sequence().get()
+            ),
+            Self::BarrierSnapshotBeforeSeal { epoch } => write!(
+                f,
+                "barrier snapshot requested before shuffle exchange epoch {} was sealed",
+                epoch.get()
             ),
             Self::EpochExhausted => f.write_str("shuffle exchange epoch exhausted"),
             Self::SequenceExhausted => f.write_str("shuffle exchange sequence exhausted"),
@@ -473,6 +480,28 @@ impl ShuffleExchangeState {
         self.lifecycle = ShuffleExchangeLifecycle::Sealed;
         self.cursor = next_cursor;
         Ok(Some(next_cursor))
+    }
+
+    /// Returns a deterministic, complete materialized view for barrier readers.
+    ///
+    /// Barrier consumers may only resolve against a sealed current epoch. The
+    /// returned locations are sorted by canonical artifact key so compatibility
+    /// snapshots do not depend on task-report arrival order.
+    pub(crate) fn barrier_locations(
+        &self,
+        epoch: ShuffleExchangeEpoch,
+    ) -> Result<Vec<PartitionLocation>> {
+        self.ensure_epoch(epoch)?;
+        if !self.lifecycle.is_sealed() {
+            return Err(ShuffleExchangeError::BarrierSnapshotBeforeSeal { epoch });
+        }
+
+        let mut entries: Vec<_> = self.artifacts.iter().collect();
+        entries.sort_by_key(|(key, _)| **key);
+        Ok(entries
+            .into_iter()
+            .map(|(_, artifact)| artifact.location.clone())
+            .collect())
     }
 
     /// Returns artifacts for one output partition that became visible after after.
