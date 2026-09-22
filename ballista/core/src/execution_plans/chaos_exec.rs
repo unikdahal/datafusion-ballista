@@ -179,38 +179,44 @@ impl ExecutionPlan for ChaosExec {
 
         // Wrap the child stream. For error/panic modes, inject on the first batch (idx == 0)
         // to mirror how real IO failures surface in production. For "delay", sleep every batch.
-        let wrapped = input_stream.enumerate().map(move |(idx, batch_result)| {
-            match fault_type.as_str() {
-                ft if ft.starts_with("delay") => {
-                    std::thread::sleep(std::time::Duration::from_millis(parse_delay_ms(ft)));
-                    batch_result
+        let wrapped = input_stream.enumerate().then(move |(idx, batch_result)| {
+            let fault_type = fault_type.clone();
+            async move {
+                match fault_type.as_str() {
+                    ft if ft.starts_with("delay") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            parse_delay_ms(ft),
+                        ))
+                        .await;
+                        batch_result
+                    }
+                    "transient" if idx == 0 && should_fail => {
+                        let error_msg = format!(
+                            "ChaosExec: Injected TRANSIENT FAILURE (recoverable) on partition {partition}"
+                        );
+                        log::error!("{}", error_msg);
+                        Err(DataFusionError::IoError(std::io::Error::other(error_msg)))
+                    }
+                    "fatal" if idx == 0 && should_fail => {
+                        let error_msg = format!(
+                            "ChaosExec: Injected FATAL FAILURE on partition {partition} (chaos testing)"
+                        );
+                        log::error!("{}", error_msg);
+                        Err(DataFusionError::Execution(error_msg))
+                    }
+                    "panic" if idx == 0 && should_fail => {
+                        log::error!("ChaosExec: Injected panic on partition {partition}");
+                        panic!("ChaosExec: injected PANIC on partition {partition}")
+                    }
+                    "transient" | "fatal" | "panic" => batch_result,
+                    config => {
+                        let error_msg = format!(
+                            "ChaosExec: wrong config value {config}, will break execution anyway, "
+                        );
+                        log::error!("{}", error_msg);
+                        Err(DataFusionError::Configuration(error_msg))
+                    }
                 }
-                "transient" if idx == 0 && should_fail => {
-                    let error_msg = format!(
-                        "ChaosExec: Injected TRANSIENT FAILURE (recoverable) on partition {partition}"
-                    );
-                    log::error!("{}",error_msg);
-                    Err(DataFusionError::IoError(std::io::Error::other(error_msg)))
-                }
-                "fatal" if idx == 0 && should_fail => {
-                    let error_msg = format!(
-                        "ChaosExec: Injected FATAL FAILURE on partition {partition} (chaos testing)"
-                    );
-                    log::error!("{}",error_msg);
-                    Err(DataFusionError::Execution(error_msg))
-                }
-                "panic" if idx == 0 && should_fail => {
-                    log::error!("ChaosExec: Injected panic on partition {partition}");
-                    panic!("ChaosExec: injected PANIC on partition {partition}")
-                }
-                "transient" | "fatal" | "panic" => batch_result,
-                config => {
-                    let error_msg = format!(
-                        "ChaosExec: wrong config value {config}, will break execution anyway, "
-                    );
-                    log::error!("{}",error_msg);
-                    Err(DataFusionError::Configuration(error_msg))
-                },
             }
         });
 

@@ -36,6 +36,8 @@ rustc-args = ["--cfg", "docsrs"]
 
 [features]
 arrow-ipc-optimizations = []
+# Process-local diagnostics used only by cross-crate integration tests.
+test-utils = []
 build-binary = ["clap", "object_store"]
 default = ["arrow-ipc-optimizations"]
 docsrs = []

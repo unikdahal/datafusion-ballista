@@ -1,7 +1,33 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 name: Pipelined shuffle validation
 
 on:
   workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run the straggler latency experiment
+        type: boolean
+        default: false
+      stack:
+        description: Validate every review branch
+        type: boolean
+        default: false
   push:
     branches: ['shuffle/**']
 
@@ -14,6 +40,10 @@ concurrency:
 
 jobs:
   validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ inputs.stack && fromJSON('["shuffle/01-input-state","shuffle/02-metadata-protocol","shuffle/03-pipelined-reader","shuffle/04-task-restriction","shuffle/05-stage-resolution","shuffle/06-tail-scheduling","shuffle/07-recovery","shuffle/08-validation"]') || fromJSON('[""]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -21,16 +51,18 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - name: Install stable Rust
+          ref: ${{ matrix.ref || github.ref }}
+      - name: Setup Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup toolchain install stable
           rustup default stable
+          rustup component add rustfmt
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # 2.9.2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Scheduler and core tests
@@ -40,9 +72,15 @@ jobs:
           PARQUET_TEST_DATA: ${{ github.workspace }}/parquet-testing/data
       - name: Check executor integration
         run: cargo check --locked -p ballista-executor --all-targets
+      - name: End-to-end local and Flight equivalence
+        if: hashFiles('ballista/client/tests/pipelined_shuffle.rs') != ''
+        run: cargo test --locked -p ballista --test pipelined_shuffle
+      - name: Straggler latency experiment
+        if: inputs.benchmark && hashFiles('ballista/client/tests/pipelined_shuffle.rs') != ''
+        run: cargo test --locked -p ballista --test pipelined_shuffle straggler_latency -- --ignored --nocapture
       - name: Upload generated protocol source
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: generated-protocol
+          name: generated-protocol-${{ strategy.job-index }}
           path: ballista/core/src/serde/generated/ballista.rs

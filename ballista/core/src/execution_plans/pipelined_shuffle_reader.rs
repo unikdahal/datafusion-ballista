@@ -20,6 +20,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+#[cfg(feature = "test-utils")]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,6 +47,26 @@ use crate::client_pool::BallistaClientPool;
 use crate::error::BallistaError;
 use crate::serde::protobuf::{self as pb, scheduler_grpc_client::SchedulerGrpcClient};
 use crate::serde::scheduler::PartitionLocation;
+
+#[cfg(feature = "test-utils")]
+static PRODUCING_INPUT_OBSERVATIONS: OnceLock<Mutex<HashSet<(String, u32, u64)>>> =
+    OnceLock::new();
+
+#[cfg(feature = "test-utils")]
+fn producing_input_observations() -> &'static Mutex<HashSet<(String, u32, u64)>> {
+    PRODUCING_INPUT_OBSERVATIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Returns whether this process has observed the specified pipelined input
+/// while its producer was still producing.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn producing_input_observed(job_id: &str, stage_id: u32, generation: u64) -> bool {
+    producing_input_observations()
+        .lock()
+        .expect("producing-input observation mutex poisoned")
+        .contains(&(job_id.to_owned(), stage_id, generation))
+}
 
 /// Runtime-only discovery transport; physical plans serialize only the handle.
 #[async_trait]
@@ -895,6 +917,17 @@ impl ExecutionPlan for PipelinedShuffleReaderExec {
                         ));
                     }
                     updates.add(1);
+                    #[cfg(feature = "test-utils")]
+                    if update.lifecycle == 0 {
+                        producing_input_observations()
+                            .lock()
+                            .expect("producing-input observation mutex poisoned")
+                            .insert((
+                                reader.handle.job_id.clone(),
+                                reader.handle.stage_id,
+                                reader.handle.generation,
+                            ));
+                    }
                     let mut locations = Vec::new();
                     for block in update.locations {
                         if block.published_version == 0

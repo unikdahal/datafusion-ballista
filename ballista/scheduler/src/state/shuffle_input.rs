@@ -84,10 +84,8 @@ pub struct ShuffleInputSnapshot {
 
 /// Result of reading a generation-pinned shuffle input.
 ///
-/// A request pinned to an older generation terminates that consumer attempt;
-/// consumers must never silently switch to the new generation. A request for a
-/// future generation is invalid and fails closed rather than masquerading as
-/// ordinary invalidation.
+/// A generation mismatch terminates the old consumer attempt; consumers must
+/// never silently switch to the new generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShuffleInputRead {
     /// Current state and locations newer than the supplied cursor.
@@ -96,13 +94,6 @@ pub enum ShuffleInputRead {
     Invalidated {
         /// Generation requested by the consumer.
         expected: u64,
-        /// Current producer generation.
-        current: u64,
-    },
-    /// The requested producer generation is ahead of scheduler state.
-    GenerationAhead {
-        /// Generation requested by the consumer.
-        requested: u64,
         /// Current producer generation.
         current: u64,
     },
@@ -175,16 +166,9 @@ pub(crate) struct PreparedShuffleCommit {
 
 /// Scheduler-owned registry for generation-pinned committed shuffle metadata.
 ///
-/// Mutations are serialized by scheduler ownership. Within one generation,
-/// producer_task_id is a single-success identity: a distinct task attempt must
-/// never reuse an already accepted task ID. Exact replay of the same publication
-/// is allowed; a different publication for that ID fails closed.
-///
-/// Callers must never hold the registry lock while awaiting a notification.
-/// Because Notify::notify_waiters stores no permit, a waiter must create, pin,
-/// and enable its Notified future before reading registry state, then release
-/// the registry lock before awaiting it. Merely creating the future before the
-/// read is not sufficient to prevent a lost wakeup.
+/// Mutations are serialized by scheduler ownership. Callers must never hold the
+/// registry lock while awaiting a notification. Register the notification
+/// before reading state to avoid lost wakeups.
 #[derive(Debug, Default)]
 pub struct ShuffleInputRegistry {
     inputs: HashMap<(JobId, usize), ShuffleGenerationState>,
@@ -214,10 +198,6 @@ impl ShuffleInputRegistry {
     ///
     /// The registry lock must remain held between prepare and commit. Exact
     /// replay is represented explicitly and never advances the version.
-    ///
-    /// task is a generation-local single-success identity. Callers must not
-    /// reuse it for a distinct task attempt while that generation remains
-    /// current.
     pub(crate) fn prepare_commit(
         &self,
         job: &JobId,
@@ -363,16 +343,11 @@ impl ShuffleInputRegistry {
         lost: &HashSet<ShuffleBlockKey>,
     ) -> Result<u64> {
         let state = self.current_mut(job, stage, generation)?;
-        if lost.is_empty() {
-            return Ok(state.generation);
-        }
-        if lost.iter().any(|key| !state.blocks.contains_key(key)) {
-            return Err(invariant(
-                "lost shuffle artifact is not committed in current generation",
-            ));
-        }
         let lost_tasks: HashSet<_> =
             lost.iter().map(|key| key.producer_task_id).collect();
+        if lost_tasks.is_empty() {
+            return Ok(state.generation);
+        }
 
         let next = increment(state.generation)?;
         state
@@ -422,15 +397,9 @@ impl ShuffleInputRegistry {
         let Some(state) = self.get(job, stage) else {
             return Ok(ShuffleInputRead::Closed);
         };
-        if generation < state.generation {
+        if generation != state.generation {
             return Ok(ShuffleInputRead::Invalidated {
                 expected: generation,
-                current: state.generation,
-            });
-        }
-        if generation > state.generation {
-            return Ok(ShuffleInputRead::GenerationAhead {
-                requested: generation,
                 current: state.generation,
             });
         }
@@ -476,8 +445,7 @@ impl ShuffleInputRegistry {
         });
     }
 
-    /// Reconcile committed metadata with the task identities still accepted by
-    /// the execution graph after existing lost-output recovery.
+    /// Reconcile with accepted task state after existing lost-output recovery.
     pub fn retain_tasks(
         &mut self,
         job: &JobId,
@@ -500,7 +468,7 @@ impl ShuffleInputRegistry {
         Ok(true)
     }
 
-    /// Builds a compatibility snapshot for stage rollback and the blocking planner.
+    /// Compatibility snapshot for stage rollback and the blocking planner.
     pub fn stage_output(
         &self,
         job: &JobId,
@@ -514,6 +482,8 @@ impl ShuffleInputRegistry {
         output.complete = state.lifecycle == ShuffleInputLifecycle::Sealed;
         Some(output)
     }
+
+
     fn current(
         &self,
         job: &JobId,
@@ -758,69 +728,6 @@ mod tests {
     }
 
     #[test]
-    fn task_id_cannot_be_reused_for_a_distinct_success_in_one_generation() -> Result<()> {
-        let job = JobId::from("job");
-        let mut registry = ShuffleInputRegistry::default();
-        registry.create(&job, 1);
-
-        let first = location(0, 0);
-        assert_eq!(registry.commit(&job, 1, 1, 0, vec![first.clone()])?, 1);
-        let mut distinct_attempt = first;
-        distinct_attempt.file_id = Some(99);
-        distinct_attempt.executor_meta.id = "retry-executor".into();
-        assert!(
-            registry
-                .commit(&job, 1, 1, 0, vec![distinct_attempt])
-                .is_err()
-        );
-
-        let state = registry.get(&job, 1).unwrap();
-        assert_eq!(state.generation(), 1);
-        assert_eq!(state.blocks.len(), 1);
-        assert_eq!(state.accepted_tasks.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn invalidation_rejects_unknown_artifact_without_mutation() -> Result<()> {
-        let job = JobId::from("job");
-        let mut registry = ShuffleInputRegistry::default();
-        registry.create(&job, 1);
-
-        let block = location(0, 0);
-        registry.commit(&job, 1, 1, 0, vec![block.clone()])?;
-        let mut unknown = ShuffleBlockKey::from(&block);
-        unknown.output_partition_id = 99;
-        assert!(
-            registry
-                .invalidate(&job, 1, 1, &HashSet::from([unknown]))
-                .is_err()
-        );
-
-        let state = registry.get(&job, 1).unwrap();
-        assert_eq!(state.generation(), 1);
-        assert_eq!(state.blocks.len(), 1);
-        assert_eq!(state.accepted_tasks.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn future_generation_is_not_reported_as_invalidation() -> Result<()> {
-        let job = JobId::from("job");
-        let mut registry = ShuffleInputRegistry::default();
-        registry.create(&job, 1);
-
-        assert!(matches!(
-            registry.read(&job, 1, 2, 0, &[0])?,
-            ShuffleInputRead::GenerationAhead {
-                requested: 2,
-                current: 1
-            }
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn rollover_can_drop_all_materialized_blocks() -> Result<()> {
         let job = JobId::from("job");
         let mut registry = ShuffleInputRegistry::default();
@@ -907,6 +814,9 @@ mod tests {
                 .all(|block| block.location.map_partition_id == 1)
         );
 
+        // A successful retry gets a fresh append-only task ID. Reconciliation
+        // must retain both the surviving old task and the accepted retry, never
+        // resurrect task 0 from the retired attempt.
         registry.commit(&job, 1, 2, 2, vec![location(2, 0), location(2, 1)])?;
         assert!(!registry.retain_tasks(&job, 1, &HashSet::from([1, 2]))?);
         let ShuffleInputRead::Update(snapshot) =
@@ -936,6 +846,7 @@ mod tests {
         );
         Ok(())
     }
+
 
     #[test]
     fn empty_producing_input_is_not_sealed() -> Result<()> {

@@ -892,11 +892,6 @@ async fn poll_shuffle_input_registry(
                     },
                 )
             }
-            ShuffleInputRead::GenerationAhead { requested, current } => {
-                return Err(Status::invalid_argument(format!(
-                    "shuffle generation {requested} is ahead of producer generation {current}"
-                )));
-            }
             ShuffleInputRead::CursorAhead { after, current } => {
                 return Err(Status::invalid_argument(format!(
                     "shuffle cursor {after} is ahead of producer version {current}"

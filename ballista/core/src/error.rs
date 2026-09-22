@@ -387,6 +387,14 @@ impl From<BallistaError> for FailedTask {
                 count_to_failures: false,
                 failed_reason: Some(FailedReason::TaskKilled(TaskKilled {})),
             },
+            BallistaError::GrpcConnectionError(desc) => FailedTask {
+                error: format!("Task setup failed due to scheduler connectivity: {desc}"),
+                retryable: true,
+                // A scheduler/control-plane outage is not evidence that this
+                // partition itself is bad, so do not burn the task retry budget.
+                count_to_failures: false,
+                failed_reason: Some(FailedReason::IoError(IoError {})),
+            },
             ref e if is_retryable_io(e) => {
                 FailedTask {
                     error: format!("Task failed due to IO error: {e:?}"),
@@ -415,6 +423,18 @@ mod tests {
 
     fn io_failed_task(e: BallistaError) -> FailedTask {
         FailedTask::from(e)
+    }
+
+    #[test]
+    fn scheduler_connection_failure_is_retryable_without_penalizing_task() {
+        let failed =
+            FailedTask::from(BallistaError::GrpcConnectionError("unavailable".into()));
+        assert!(failed.retryable);
+        assert!(!failed.count_to_failures);
+        assert!(matches!(
+            failed.failed_reason,
+            Some(FailedReason::IoError(_))
+        ));
     }
 
     fn fetch_failed(
