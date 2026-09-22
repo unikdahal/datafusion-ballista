@@ -2661,8 +2661,7 @@ mod test {
                 break;
             }
             let task_id = stage.task_infos.len();
-            let mut info =
-                super::create_task_info("producer-straggler".into(), task_id);
+            let mut info = super::create_task_info("producer-straggler".into(), task_id);
             info.global_input_partition_ids = partitions;
             info.vcores_consumed = 1;
             stage.task_infos.push(info);
